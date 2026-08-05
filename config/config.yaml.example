@@ -1,0 +1,121 @@
+# GO-CHAT 服务配置示例
+# 复制为 config/config.yaml 后按实际环境修改；敏感项建议用 GOChat_ 前缀环境变量注入，
+# 例如：GOChat_AUTH_JWT_SECRET、GOChat_MYSQL_DSN、GOChat_KAFKA_BROKERS=host1:9092,host2:9092
+
+server:
+  addr: ":8080"                       # HTTP / WebSocket 监听地址
+  node_id: "node-1"                   # 多网关节点唯一标识（多节点时区分）
+  shutdown_timeout: 10s               # 优雅退出等待
+  ws_read_limit: 65536                # 单个 WebSocket Frame 最大字节数
+  ws_heartbeat_interval: 30s          # 服务端心跳间隔
+  ws_missed_heartbeat: 2              # 连续未响应心跳次数达到该值断开
+  ws_write_queue_size: 256            # 单连接出站队列容量（有界，慢客户端背压）
+  ws_write_queue_timeout: 30s         # 出站队列持续满达到该时长后断开慢连接
+
+mysql:
+  # 账号需具备 gochat 库权限；迁移脚本由 cmd/migrate 或 make migrate 执行
+  dsn: "gochat:gochat@tcp(127.0.0.1:3306)/gochat?charset=utf8mb4&parseTime=True&loc=UTC"
+  max_open_conns: 40
+  max_idle_conns: 10
+  conn_max_lifetime: 30m
+  read_max_open_conns: 24            # 读查询连接池上限（历史查询/会话列表）
+  write_max_open_conns: 16           # 写事务连接池上限（持久化/Outbox/号段）
+  slow_threshold: 200ms
+
+redis:
+  addr: "127.0.0.1:6379"
+  password: ""
+  db: 0
+  pool_size: 40
+  dial_timeout: 1s
+  read_timeout: 500ms
+  write_timeout: 500ms
+
+kafka:
+  brokers:
+    - "127.0.0.1:9092"
+  topic_prefix: ""                    # 环境后缀，如 "dev" → im.message.ingress.dev
+  producer_timeout: 3s                # 生产超时（入口侧实际使用 resilience.ingress_publish_timeout）
+  producer_acks_all: true             # acks=all + min.insync.replicas 配合
+  persist_group: "gochat-message-persist-v1"
+  delivery_group: "gochat-message-delivery-v1"
+  auto_offset_reset: "earliest"       # 新环境 replay 需求：earliest / latest
+  max_poll_records: 100
+  persist_max_retries: 5              # MySQL 持久化临时失败重试上限
+  persist_backoff: 200ms
+  outbox_max_retries: 10              # Outbox 发布失败最大重试，超出进入死信
+  outbox_backoff: 2s
+  outbox_poll_interval: 500ms
+  outbox_batch_size: 100
+
+auth:
+  jwt_secret: "change-me-in-production"  # 生产必须用环境变量 GOChat_AUTH_JWT_SECRET 注入
+  access_token_ttl: 2h
+  ticket_ttl: 30s                     # WebSocket 一次性票据有效期
+  argon2_time: 1
+  argon2_memory: 65536                # 64 MiB
+  argon2_threads: 4
+  argon2_key_len: 32
+
+idgen:
+  step: 2000                          # 每次申请号段长度（im_message 建议 2000）
+  prefetch_ratio: 0.70                # 当前号段使用达到 70% 时预加载下一段
+  allocate_timeout: 100ms             # 申请新号段超时
+  next_wait_timeout: 50ms             # current 耗尽等待 next 的上限
+  cas_max_retries: 10                 # 分布式 CAS 冲突重试
+
+presence:
+  conn_hash_ttl: 90s                  # 连接路由 HASH TTL（心跳 30s）
+  user_set_ttl: 3m                    # 用户在线 ZSET TTL
+  recent_cache_ttl: 24h               # 最近消息缓存 TTL
+  recent_cache_max: 200               # 每会话缓存最大消息数
+  idem_processing_ttl: 5s             # 幂等"处理中" TTL
+  idem_accepted_ttl: 10m              # 幂等"已接受" TTL
+
+resilience:
+  # 依赖调用超时（内层 < 外层）
+  redis_read_timeout: 50ms
+  redis_write_timeout: 80ms
+  mysql_query_timeout: 200ms
+  persist_tx_timeout: 500ms
+  ingress_publish_timeout: 300ms
+  segment_timeout: 100ms
+  pubsub_timeout: 100ms
+
+  # 限流：L2 Redis 令牌桶 + L1 本地兜底
+  send_per_second: 20                 # 单用户发送 20 条/秒
+  send_burst: 40
+  conversation_per_second: 100        # 单会话发送 100 条/秒（大群配额）
+  conversation_burst: 200
+  history_per_second: 10              # 历史查询 10 次/秒
+  history_burst: 20
+  login_per_minute: 5                 # 登录 5 次/分钟（IP + 用户名）
+  ws_connect_per_minute: 60           # 建连 60 次/分钟（IP）
+  ws_connect_per_user_per_minute: 5   # 建连 5 次/分钟（用户）
+  conn_inbound_per_second: 100        # 单连接入站事件 100 条/秒
+  conn_inbound_burst: 150
+
+  # 隔离并发（Semaphore / Worker 数）
+  history_query_concurrency: 32
+  ws_ingress_concurrency: 32
+  persist_workers: 8
+  outbox_workers: 4
+  delivery_workers: 8
+  group_fanout_concurrency: 4
+
+  # 熔断器，按 依赖:操作 维度
+  breakers:
+    - { name: "redis:recent_get",       interval: 10s, min_requests: 20, failure_ratio: 0.5, open_timeout: 5s,  half_open_max: 3 }
+    - { name: "redis:gateway_publish",  interval: 10s, min_requests: 20, failure_ratio: 0.5, open_timeout: 5s,  half_open_max: 3 }
+    - { name: "kafka:ingress_publish",  interval: 10s, min_requests: 10, failure_ratio: 0.3, open_timeout: 3s,  half_open_max: 3 }
+    - { name: "kafka:persisted_publish",interval: 10s, min_requests: 10, failure_ratio: 0.3, open_timeout: 5s,  half_open_max: 3 }
+    - { name: "mysql:history_query",    interval: 10s, min_requests: 20, failure_ratio: 0.5, open_timeout: 3s,  half_open_max: 3 }
+    - { name: "mysql:id_segment",       interval: 30s, min_requests: 5,  failure_ratio: 0.6, open_timeout: 10s, half_open_max: 1 }
+
+metrics:
+  enabled: true
+  path: "/metrics"
+
+log:
+  level: "info"
+  pretty: false

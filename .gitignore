@@ -1,0 +1,16 @@
+# 编译产物
+bin/
+*.exe
+
+# 本地配置（用户自建，含密钥）
+config/config.yaml
+.env
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# 日志与临时文件
+*.log
+/tmp/
