@@ -51,5 +51,5 @@ USER appuser
 # 告知 Docker 该容器监听 8080（仅文档作用，不真正开放端口）
 EXPOSE 8080
 
-# 容器启动时执行的命令；docker-compose 里可被 command 覆盖（migrate 服务就是这么做）
+# 容器启动时执行服务程序；迁移服务通过 docker-compose 覆盖 ENTRYPOINT。
 ENTRYPOINT ["/app/gochat"]

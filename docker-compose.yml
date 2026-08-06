@@ -90,7 +90,9 @@ services:
         condition: service_healthy
     environment:
       GOChat_MYSQL_DSN: "${MYSQL_USER:-gochat}:${MYSQL_PASSWORD:?}@tcp(mysql:3306)/${MYSQL_DATABASE:-gochat}?charset=utf8mb4&parseTime=True&loc=UTC"
-    command: ["/app/gochat-migrate"]
+    # Dockerfile 的 ENTRYPOINT 默认是 /app/gochat；迁移工具必须覆盖
+    # ENTRYPOINT，不能只用 command（否则会把路径当成 server 参数）。
+    entrypoint: ["/app/gochat-migrate"]
 
   # GO-CHAT 应用服务
   app:
