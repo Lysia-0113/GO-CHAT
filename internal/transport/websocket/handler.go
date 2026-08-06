@@ -16,6 +16,7 @@ import (
 	"github.com/Lysia-0113/GO-CHAT/internal/infrastructure/redis"
 	"github.com/Lysia-0113/GO-CHAT/internal/message"
 	"github.com/Lysia-0113/GO-CHAT/internal/metrics"
+	"github.com/Lysia-0113/GO-CHAT/internal/transport/http/middleware"
 )
 
 // Handler 是 WebSocket 入口：Ticket 升级、读写循环、心跳与事件分发
@@ -108,7 +109,7 @@ func (h *Handler) CreateTicket(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "参数错误"})
 		return
 	}
-	userID := currentUserID(c)
+	userID := middleware.CurrentUserID(c)
 	if userID <= 0 {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "未登录"})
 		return
@@ -220,18 +221,6 @@ func (h *Handler) sendReady(conn *Conn) {
 		return
 	}
 	_ = conn.Push(context.Background(), event)
-}
-
-// currentUserID 读取鉴权中间件注入的用户 ID。
-func currentUserID(c *gin.Context) int64 {
-	v, ok := c.Get("user_id")
-	if !ok {
-		return 0
-	}
-	if id, ok := v.(int64); ok {
-		return id
-	}
-	return 0
 }
 
 func getRequestID(c *gin.Context) string {
