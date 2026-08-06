@@ -15,6 +15,8 @@ WORKDIR /src
 # 先只拷贝依赖清单并下载，利用 Docker 层缓存：
 # 只要 go.mod/go.sum 没变，这层就复用，不用每次重新下载依赖
 COPY go.mod go.sum ./
+# 国内服务器访问 proxy.golang.org 不稳定，改用七牛 goproxy 镜像
+ENV GOPROXY=https://goproxy.cn,direct
 RUN go mod download
 
 # 再拷贝全部源码（migrations 已 embed 进二进制，不需要单独拷 SQL）
@@ -34,7 +36,9 @@ FROM alpine:3.21
 # ca-certificates：Go 程序访问 HTTPS（如后续对接外部服务）需要根证书
 # tzdata：容器内默认 UTC，装时区数据供配置/日志使用
 # adduser：创建非 root 用户，容器内以低权限运行，降低被攻破后的影响面
-RUN apk add --no-cache ca-certificates tzdata \
+# 先替换 Alpine 软件源为阿里云镜像（官方源在国内慢）
+RUN sed -i 's#dl-cdn.alpinelinux.org#mirrors.aliyun.com#g' /etc/apk/repositories \
+    && apk add --no-cache ca-certificates tzdata \
     && adduser -D -u 10001 appuser
 
 WORKDIR /app
