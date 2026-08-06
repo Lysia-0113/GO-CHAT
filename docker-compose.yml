@@ -11,8 +11,7 @@ services:
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
-    ports:
-      - "3306:3306"
+    # 不映射公网端口：容器间走 compose 内部网络，数据库不对公网开放
     volumes:
       - mysql_data:/var/lib/mysql
     healthcheck:
@@ -24,8 +23,7 @@ services:
   redis:
     image: redis:7.2
     container_name: gochat-redis
-    ports:
-      - "6379:6379"
+    # 不映射公网端口：缓存不对公网开放
     volumes:
       - redis_data:/data
     healthcheck:
@@ -37,8 +35,7 @@ services:
   kafka:
     image: apache/kafka:3.9.0
     container_name: gochat-kafka
-    ports:
-      - "9092:9092"
+    # 不映射公网端口：消息队列不对公网开放（app 容器经内部网络访问）
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
