@@ -2,6 +2,7 @@ services:
   mysql:
     image: mysql:8.0
     container_name: gochat-mysql
+    mem_limit: 512m
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?请在 .env 中设置 MYSQL_ROOT_PASSWORD}
       MYSQL_DATABASE: ${MYSQL_DATABASE:-gochat}
@@ -11,6 +12,10 @@ services:
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=30
+      - --table-open-cache=256
+      - --performance-schema=OFF
     # 不映射公网端口：容器间走 compose 内部网络，数据库不对公网开放
     volumes:
       - mysql_data:/var/lib/mysql
@@ -23,7 +28,18 @@ services:
   redis:
     image: redis:7.2
     container_name: gochat-redis
+    mem_limit: 128m
     # 不映射公网端口：缓存不对公网开放
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 96mb
+      - --maxmemory-policy
+      - allkeys-lru
     volumes:
       - redis_data:/data
     healthcheck:
@@ -35,6 +51,7 @@ services:
   kafka:
     image: apache/kafka:3.9.0
     container_name: gochat-kafka
+    mem_limit: 512m
     # 不映射公网端口：消息队列不对公网开放（app 容器经内部网络访问）
     environment:
       KAFKA_NODE_ID: 1
@@ -51,6 +68,10 @@ services:
       KAFKA_NUM_PARTITIONS: 3
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
       KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_LOG_RETENTION_BYTES: 1073741824
+      KAFKA_LOG_SEGMENT_BYTES: 268435456
+      # 单节点 Kafka 的 JVM 堆；mem_limit 还为 JVM 原生内存预留空间。
+      KAFKA_HEAP_OPTS: "-Xms256m -Xmx256m"
     volumes:
       - kafka_data:/tmp/kraft-combined-logs
     healthcheck:
@@ -85,11 +106,13 @@ services:
     ports:
       - "8080:8080"
     environment:
+      GOChat_CONFIG: "/app/config/config.yaml"
       GOChat_SERVER_ADDR: ":8080"
       GOChat_MYSQL_DSN: "${MYSQL_USER:-gochat}:${MYSQL_PASSWORD:?}@tcp(mysql:3306)/${MYSQL_DATABASE:-gochat}?charset=utf8mb4&parseTime=True&loc=UTC"
       GOChat_REDIS_ADDR: "redis:6379"
       GOChat_KAFKA_BROKERS: "kafka:9092"
       GOChat_AUTH_JWT_SECRET: "${GOCHAT_JWT_SECRET:?请在 .env 中设置 GOCHAT_JWT_SECRET}"
+    mem_limit: 384m
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health/live"]
       interval: 10s

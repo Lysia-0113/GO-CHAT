@@ -1,0 +1,40 @@
+# 2C2G 轻量服务器配置。
+#
+# 该文件只覆盖相对默认配置需要收紧的资源参数；未列出的字段继续使用
+# internal/bootstrap 的默认值。敏感信息和容器内依赖地址由 docker-compose
+# 通过环境变量注入，不要把真实密码写进本文件。
+
+server:
+  # 限制单个慢 WebSocket 连接占用的出站队列内存。
+  ws_write_queue_size: 128
+
+mysql:
+  max_open_conns: 12
+  max_idle_conns: 4
+  read_max_open_conns: 8
+  write_max_open_conns: 4
+
+redis:
+  pool_size: 12
+
+kafka:
+  # 当前消费者实现使用固定的 8MiB 单次读取上限；该值用于保留低配
+  # 部署的批量意图，后续接入可配置 reader 时直接生效。
+  max_poll_records: 20
+  outbox_batch_size: 20
+
+auth:
+  # 2 核机器避免 Argon2 为单次哈希创建过多工作线程；保留 64MiB
+  # 内存参数，不牺牲密码哈希的内存硬度。
+  argon2_threads: 2
+
+presence:
+  recent_cache_max: 100
+
+resilience:
+  history_query_concurrency: 8
+  ws_ingress_concurrency: 8
+  persist_workers: 2
+  outbox_workers: 1
+  delivery_workers: 2
+  group_fanout_concurrency: 2

@@ -23,8 +23,10 @@ COPY . .
 # CGO_ENABLED=0：纯静态编译，产物不依赖系统动态库，任何 Linux 都能跑
 # -trimpath：产物里不带本机绝对路径，避免泄漏目录结构
 # -ldflags="-s -w"：去掉调试符号，减小镜像体积
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/gochat ./cmd/server \
-    && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/gochat-migrate ./cmd/migrate
+# -p=1 / GOMAXPROCS=2 限制构建期并行度，避免 2C2G 服务器构建镜像时
+# 被 Go 编译器短时间占满内存；只影响构建速度，不影响运行时并发。
+RUN GOMAXPROCS=2 CGO_ENABLED=0 GOOS=linux go build -p=1 -trimpath -ldflags="-s -w" -o /out/gochat ./cmd/server \
+    && GOMAXPROCS=2 CGO_ENABLED=0 GOOS=linux go build -p=1 -trimpath -ldflags="-s -w" -o /out/gochat-migrate ./cmd/migrate
 
 # ---------- 阶段 2：运行 ----------
 FROM alpine:3.21
@@ -36,9 +38,13 @@ RUN apk add --no-cache ca-certificates tzdata \
     && adduser -D -u 10001 appuser
 
 WORKDIR /app
+RUN mkdir -p /app/config
 
 # 只拷贝编译产物，编译器和源码都不进最终镜像
 COPY --from=builder /out/gochat /out/gochat-migrate ./
+# 运行镜像必须带有配置文件；该文件只含低配参数，密码和依赖地址仍由
+# docker-compose 的环境变量覆盖。
+COPY config/config.2c2g.yaml /app/config/config.yaml
 
 USER appuser
 
