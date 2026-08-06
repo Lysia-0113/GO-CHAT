@@ -38,3 +38,4 @@ resilience:
   outbox_workers: 1
   delivery_workers: 2
   group_fanout_concurrency: 2
+  ws_connect_per_minute: 3000
