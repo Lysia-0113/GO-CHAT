@@ -189,11 +189,16 @@ type LogConfig struct {
 
 // LoadConfig 从 path 读取 YAML 配置，随后用 GOChat_ 前缀环境变量覆盖。
 // 覆盖规则：GOChat_MYSQL_DSN、GOChat_AUTH_JWT_SECRET 等；数组类暂不支持 env 覆盖。
+// 文件不存在时回退为默认配置 + 环境变量覆盖，便于 Docker 等纯环境变量部署。
 func LoadConfig(path string) (*Config, error) {
 	cfg := defaultConfig()
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+		applyEnvOverrides(cfg)
+		return cfg, nil
 	}
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, err

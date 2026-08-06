@@ -1,0 +1,25 @@
+# GitHub Actions：push / PR 后自动执行检查
+# 原理：GitHub 在云端起一台临时 Linux 机器，按下面步骤跑完即销毁
+# 运行位置：仓库 Settings → Actions 里能看到每次运行的结果
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4          # ① 把代码拷到临时机器
+      - uses: actions/setup-go@v5         # ② 装 Go 1.26
+        with:
+          go-version: "1.26.x"
+          cache: true                     #    缓存依赖，加速下次运行
+      - name: Vet
+        run: go vet ./...                 # ③ 静态检查（未使用的代码/可疑写法）
+      - name: Test (race)
+        run: go test ./... -race -count=1 # ④ 跑全部测试（-race 检测并发竞态）
+      - name: Build
+        run: go build ./...               # ⑤ 确认能编译

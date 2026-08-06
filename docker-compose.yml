@@ -3,10 +3,10 @@ services:
     image: mysql:8.0
     container_name: gochat-mysql
     environment:
-      MYSQL_ROOT_PASSWORD: gochat
-      MYSQL_DATABASE: gochat
-      MYSQL_USER: gochat
-      MYSQL_PASSWORD: gochat
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?请在 .env 中设置 MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-gochat}
+      MYSQL_USER: ${MYSQL_USER:-gochat}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?请在 .env 中设置 MYSQL_PASSWORD}
       TZ: Asia/Shanghai
     command:
       - --character-set-server=utf8mb4
@@ -16,7 +16,7 @@ services:
     volumes:
       - mysql_data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-pgochat"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_PASSWORD:?}"]
       interval: 5s
       timeout: 3s
       retries: 30
@@ -43,7 +43,7 @@ services:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
@@ -61,6 +61,44 @@ services:
       interval: 5s
       timeout: 5s
       retries: 30
+
+  # 一次性建表工具：不随 up -d 启动，手动执行：
+  #   docker compose --profile tools run --rm migrate
+  migrate:
+    build: .
+    profiles: ["tools"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      GOChat_MYSQL_DSN: "${MYSQL_USER:-gochat}:${MYSQL_PASSWORD:?}@tcp(mysql:3306)/${MYSQL_DATABASE:-gochat}?charset=utf8mb4&parseTime=True&loc=UTC"
+    command: ["/app/gochat-migrate"]
+
+  # GO-CHAT 应用服务
+  app:
+    build: .
+    container_name: gochat-app
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      GOChat_SERVER_ADDR: ":8080"
+      GOChat_MYSQL_DSN: "${MYSQL_USER:-gochat}:${MYSQL_PASSWORD:?}@tcp(mysql:3306)/${MYSQL_DATABASE:-gochat}?charset=utf8mb4&parseTime=True&loc=UTC"
+      GOChat_REDIS_ADDR: "redis:6379"
+      GOChat_KAFKA_BROKERS: "kafka:9092"
+      GOChat_AUTH_JWT_SECRET: "${GOCHAT_JWT_SECRET:?请在 .env 中设置 GOCHAT_JWT_SECRET}"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health/live"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
 
 volumes:
   mysql_data:

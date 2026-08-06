@@ -1,0 +1,23 @@
+# 构建 Docker 镜像时排除的文件/目录（发给 Docker 的"打包清单"）
+# 作用：1) 防止密钥泄漏进镜像  2) 减小构建上下文，构建更快
+
+# 密钥类：本地配置文件含数据库密码和 JWT secret，绝对不能进镜像
+config/config.yaml
+.env
+*.pem
+*.key
+
+# Git 元数据（镜像里不需要，也防止历史记录泄漏）
+.git
+.gitignore
+
+# 编译产物与缓存
+bin/
+*.exe
+*.log
+
+# 开发/文档辅助文件（镜像里用不到）
+tests/
+docs/
+api/
+*.md
