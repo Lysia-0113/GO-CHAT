@@ -22,6 +22,7 @@ type Conn struct {
 	ws                *websocket.Conn
 	send              chan []byte
 	writeQueueTimeout time.Duration
+	writeMu           sync.Mutex // gorilla 禁止并发写：writer/heartbeat 两个协程必须串行
 
 	lastPong  atomic.Int64 // 毫秒时间戳
 	closed    atomic.Bool
@@ -116,6 +117,14 @@ func (c *Conn) LastPongAt() time.Time { return time.UnixMilli(c.lastPong.Load())
 
 // Closed 返回是否已关闭。
 func (c *Conn) Closed() bool { return c.closed.Load() }
+
+// WriteMessage 串行写 Socket：writerLoop 与 heartbeatLoop 两个协程共用，
+// gorilla/websocket 禁止并发写（GOCHAT_API.md §6.8），必须串行化。
+func (c *Conn) WriteMessage(raw []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.ws.WriteMessage(websocket.TextMessage, raw)
+}
 
 // Close 关闭连接（幂等）：关闭队列并发送关闭帧。
 func (c *Conn) Close(reason string) {
