@@ -133,7 +133,14 @@ func (w *Worker) handle(ctx context.Context, msg kafka.Message) error {
 // pushToMember 向成员的全部在线连接投递（本机直推或跨节点 Pub/Sub）。
 func (w *Worker) pushToMember(ctx context.Context, event message.MessagePersistedEvent, memberID int64) {
 	routes, err := w.presence.OnlineConnections(ctx, memberID)
-	if err != nil || len(routes) == 0 {
+	if err != nil {
+		// 在线查询失败：投递缺口主嫌疑（之前被静默吞掉）
+		if w.reg != nil {
+			w.reg.Counter(metrics.NameOnlineQueryFailed, "在线状态查询失败数", nil).Inc()
+		}
+		return
+	}
+	if len(routes) == 0 {
 		return // 离线：由 after_seq 补偿，不需要 Kafka 副本（GOCHAT_KAFKA.md §9.2）
 	}
 
@@ -146,7 +153,11 @@ func (w *Worker) pushToMember(ctx context.Context, event message.MessagePersiste
 	for _, route := range routes {
 		if route.NodeID == w.manager.NodeID() {
 			// 本机连接直推
-			_ = w.manager.PushToConnection(ctx, route.ConnectionID, ev)
+			if err := w.manager.PushToConnection(ctx, route.ConnectionID, ev); err != nil {
+				if w.reg != nil {
+					w.reg.Counter(metrics.NamePushToConnFailed, "投递推送失败数", nil).Inc()
+				}
+			}
 			continue
 		}
 		if w.pubsub != nil {

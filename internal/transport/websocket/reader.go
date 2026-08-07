@@ -9,6 +9,7 @@ import (
 	"github.com/Lysia-0113/GO-CHAT/internal/connection"
 	"github.com/Lysia-0113/GO-CHAT/internal/errs"
 	"github.com/Lysia-0113/GO-CHAT/internal/message"
+	"github.com/Lysia-0113/GO-CHAT/internal/metrics"
 )
 
 // readerLoop 是单连接读协程：逐条解析事件并分发
@@ -69,6 +70,9 @@ func (h *Handler) dispatch(ctx context.Context, conn *Conn, raw []byte) {
 
 // onSend 处理 message.send（GOCHAT_API.md §6.5）。
 func (h *Handler) onSend(ctx context.Context, conn *Conn, env inbound) {
+	if h.reg != nil {
+		h.reg.Counter(metrics.NameWSIngressReceived, "收到的 message.send 总数", nil).Inc()
+	}
 	payload, err := parseSend(env.Data)
 	if err != nil {
 		h.writeError(conn, env.RequestID, err)
@@ -94,6 +98,14 @@ func (h *Handler) onSend(ctx context.Context, conn *Conn, env inbound) {
 		ClientSentAt:    payload.ClientSentAt,
 	})
 	if err != nil {
+		// 发布失败：计数 + 日志（客户端靠 error 事件 + 幂等重试兜底）
+		if h.reg != nil {
+			h.reg.Counter(metrics.NamePublishFailed, "Kafka 发布失败数", nil).Inc()
+		}
+		h.log.Error("publish failed",
+			"client_msg_id", payload.ClientMessageID,
+			"error", err.Error(),
+		)
 		h.writeError(conn, env.RequestID, err)
 		return
 	}
@@ -106,7 +118,11 @@ func (h *Handler) onSend(ctx context.Context, conn *Conn, env inbound) {
 	})
 	if eerr == nil {
 		event.RequestID = env.RequestID
-		_ = conn.Push(ctx, event)
+		if err := conn.Push(ctx, event); err != nil {
+			if h.reg != nil {
+				h.reg.Counter(metrics.NamePushDropped, "回执推送丢弃数", nil).Inc()
+			}
+		}
 	}
 }
 
@@ -210,5 +226,10 @@ func (h *Handler) writeError(conn *Conn, requestID string, err error) {
 		return
 	}
 	event.RequestID = requestID
-	_ = conn.Push(context.Background(), event)
+	if err := conn.Push(context.Background(), event); err != nil {
+		// 错误告知本身也可能被丢弃：客户端靠超时 + 幂等重试兜底
+		if h.reg != nil {
+			h.reg.Counter(metrics.NamePushDropped, "回执推送丢弃数", nil).Inc()
+		}
+	}
 }

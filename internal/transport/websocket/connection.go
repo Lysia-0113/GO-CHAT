@@ -30,6 +30,8 @@ type Conn struct {
 
 	// OnSlowConnection 队列持续满时的回调（指标与日志）
 	OnSlowConnection func(connID string)
+	// OnClose 连接关闭时的回调（日志与指标）
+	OnClose func(reason string)
 	// queueStalled 记录队列持续未排空的时间起点（毫秒）
 	queueStalled atomic.Int64
 }
@@ -134,6 +136,9 @@ func (c *Conn) Close(reason string) {
 		_ = c.ws.WriteControl(websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseGoingAway, reason),
 			time.Now().Add(time.Second))
+		if c.OnClose != nil {
+			c.OnClose(reason)
+		}
 	})
 }
 

@@ -186,6 +186,14 @@ const (
 	NameWSTicketReplayRejected = "ws_ticket_replay_rejected_total"
 	NameIdemFastHit            = "idem_fast_hit_total"
 	NameKafkaDLQ               = "kafka_dlq_total"
+
+	// 可观测性补充（2026-08 压测埋点）：消息管线每站一个计数器
+	NameWSIngressReceived = "ws_ingress_received_total"
+	NamePublishFailed     = "publish_failed_total"
+	NamePushDropped       = "push_dropped_total"
+	NameCloseReason       = "close_reason_total"
+	NameOnlineQueryFailed = "online_query_failed_total"
+	NamePushToConnFailed  = "push_to_connection_failed_total"
 )
 
 // NowUnix 供外部记录时间戳。

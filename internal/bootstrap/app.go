@@ -98,6 +98,7 @@ func Build(ctx context.Context, cfg *Config, log *slog.Logger) (*App, error) {
 		Timeout:     cfg.Kafka.ProducerTimeout,
 		AcksAll:     cfg.Kafka.ProducerAcksAll,
 		TopicSuffix: cfg.Kafka.TopicPrefix,
+		Logger:      kafkainfra.SlogLogger(log),
 	}, newBreakers(cfg, reg), reg, "gateway")
 	if err != nil {
 		return nil, fmt.Errorf("kafka producer: %w", err)
@@ -195,6 +196,7 @@ func Build(ctx context.Context, cfg *Config, log *slog.Logger) (*App, error) {
 		MaxBytes:         8 * 1024 * 1024,
 		SessionTimeout:   10 * time.Second,
 		RebalanceTimeout: 10 * time.Second,
+		Logger:           kafkainfra.SlogLogger(log),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("kafka persist consumer: %w", err)
@@ -207,6 +209,7 @@ func Build(ctx context.Context, cfg *Config, log *slog.Logger) (*App, error) {
 		MaxBytes:         8 * 1024 * 1024,
 		SessionTimeout:   10 * time.Second,
 		RebalanceTimeout: 10 * time.Second,
+		Logger:           kafkainfra.SlogLogger(log),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("kafka deliver consumer: %w", err)

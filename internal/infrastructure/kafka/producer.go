@@ -2,6 +2,8 @@ package kafka
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
 	"time"
 
 	kafkago "github.com/segmentio/kafka-go"
@@ -31,6 +33,7 @@ type ProducerConfig struct {
 	Timeout     time.Duration // 等待 acks=all 的超时上限
 	AcksAll     bool
 	TopicSuffix string
+	Logger      kafkago.Logger // 可选；nil 时静默（nopLogger）
 }
 
 // NewProducer 创建生产者。
@@ -39,6 +42,10 @@ func NewProducer(cfg ProducerConfig, breakers *resilience.Breakers, reg *metrics
 	acks := kafkago.RequireAll
 	if !cfg.AcksAll {
 		acks = kafkago.RequireOne
+	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = nopLogger{}
 	}
 	writer := &kafkago.Writer{
 		Addr:                   kafkago.TCP(cfg.Brokers...),
@@ -49,7 +56,7 @@ func NewProducer(cfg ProducerConfig, breakers *resilience.Breakers, reg *metrics
 		BatchSize:              100,
 		WriteTimeout:           cfg.Timeout,
 		AllowAutoTopicCreation: true,
-		Logger:                 nopLogger{},
+		Logger:                 logger,
 	}
 	return &Producer{
 		topics:       NewTopics(cfg.TopicSuffix),
@@ -143,3 +150,18 @@ func parseID(s string) int64 {
 type nopLogger struct{}
 
 func (nopLogger) Printf(string, ...interface{}) {}
+
+// slogLogger 把应用日志接入 kafka-go 的 Printf 接口（替代 nopLogger，生产可观测）。
+type slogLogger struct{ log *slog.Logger }
+
+func (l slogLogger) Printf(format string, v ...interface{}) {
+	l.log.Warn(fmt.Sprintf(format, v...))
+}
+
+// SlogLogger 构造 kafka-go 日志适配器；log 为 nil 时回退 nopLogger。
+func SlogLogger(log *slog.Logger) kafkago.Logger {
+	if log == nil {
+		return nopLogger{}
+	}
+	return slogLogger{log: log}
+}

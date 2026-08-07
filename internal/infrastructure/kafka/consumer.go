@@ -26,6 +26,7 @@ type ConsumerConfig struct {
 	MaxBytes         int
 	SessionTimeout   time.Duration
 	RebalanceTimeout time.Duration
+	Logger           kafkago.Logger // 可选；nil 时静默（nopLogger）
 }
 
 // NewConsumer 创建消费者。
@@ -33,6 +34,10 @@ func NewConsumer(cfg ConsumerConfig) (*Consumer, error) {
 	offset := kafkago.FirstOffset
 	if cfg.StartOffset == "latest" {
 		offset = kafkago.LastOffset
+	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = nopLogger{}
 	}
 	reader := kafkago.NewReader(kafkago.ReaderConfig{
 		Brokers:          cfg.Brokers,
@@ -43,7 +48,7 @@ func NewConsumer(cfg ConsumerConfig) (*Consumer, error) {
 		SessionTimeout:   cfg.SessionTimeout,
 		RebalanceTimeout: cfg.RebalanceTimeout,
 		CommitInterval:   0, // 手动提交：业务成功后才提交
-		Logger:           nopLogger{},
+		Logger:           logger,
 	})
 	return &Consumer{reader: reader, topic: cfg.Topic, group: cfg.Group}, nil
 }

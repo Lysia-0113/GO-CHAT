@@ -178,6 +178,17 @@ func (h *Handler) Upgrade(c *gin.Context) {
 
 	connID := "conn_" + uuid.NewString()
 	conn := NewConn(connID, ticket.UserID, ticket.DeviceID, ws, h.writeQueueSize, h.writeQueueTimeout)
+	conn.OnClose = func(reason string) {
+		h.log.Warn("connection closed",
+			"connection_id", conn.ID(),
+			"user_id", conn.UserID(),
+			"reason", reason,
+		)
+		if h.reg != nil {
+			h.reg.Counter(metrics.NameCloseReason, "连接关闭原因",
+				map[string]string{"reason": reason}).Inc()
+		}
+	}
 
 	// 4. 注册连接（进程内 + Redis Presence）
 	if err := h.manager.Register(ctx, conn); err != nil {
