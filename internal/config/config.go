@@ -1,5 +1,9 @@
-// Package bootstrap 提供配置加载与应用装配。
-package bootstrap
+// Package config 提供全部运行时配置的加载（YAML + 环境变量覆盖）。
+//
+// 独立成包的原因（GOCHAT_API.md §11.3）：svc.ServiceContext 需要持有 Config，
+// 而 bootstrap 要构造 svcCtx；Config 若留在 bootstrap 会造成 bootstrap↔svc 循环导入。
+// 与 go-zero 的 internal/config + internal/svc 布局一致。
+package config
 
 import (
 	"os"

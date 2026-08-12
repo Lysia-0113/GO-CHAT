@@ -6,19 +6,18 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	goredis "github.com/redis/go-redis/v9"
-	"gorm.io/gorm"
+
+	"github.com/Lysia-0113/GO-CHAT/internal/svc"
 )
 
 // HealthHandler 处理 /health/live 与 /health/ready（GOCHAT_API.md §2.3）。
 type HealthHandler struct {
-	db      *gorm.DB
-	redis   *goredis.Client
+	svcCtx  *svc.ServiceContext
 	readyFn func(ctx context.Context) error // Kafka 等额外就绪检查
 }
 
-func NewHealthHandler(db *gorm.DB, redis *goredis.Client, readyFn func(ctx context.Context) error) *HealthHandler {
-	return &HealthHandler{db: db, redis: redis, readyFn: readyFn}
+func NewHealthHandler(svcCtx *svc.ServiceContext, readyFn func(ctx context.Context) error) *HealthHandler {
+	return &HealthHandler{svcCtx: svcCtx, readyFn: readyFn}
 }
 
 // Live 进程存活探针：进程存在即 200。
@@ -34,16 +33,16 @@ func (h *HealthHandler) Ready(c *gin.Context) {
 	checks := make(map[string]string)
 	ok := true
 
-	if h.db != nil {
-		sqlDB, err := h.db.DB()
+	if h.svcCtx.DB != nil {
+		sqlDB, err := h.svcCtx.DB.DB()
 		if err == nil {
 			err = sqlDB.PingContext(ctx)
 		}
 		checks["mysql"] = statusOf(err)
 		ok = ok && err == nil
 	}
-	if h.redis != nil {
-		err := h.redis.Ping(ctx).Err()
+	if h.svcCtx.Redis != nil {
+		err := h.svcCtx.Redis.Ping(ctx).Err()
 		checks["redis"] = statusOf(err)
 		ok = ok && err == nil
 	}

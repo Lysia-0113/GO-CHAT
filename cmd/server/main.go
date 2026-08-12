@@ -14,6 +14,7 @@ import (
 	"syscall"
 
 	"github.com/Lysia-0113/GO-CHAT/internal/bootstrap"
+	"github.com/Lysia-0113/GO-CHAT/internal/config"
 )
 
 func main() {
@@ -21,7 +22,7 @@ func main() {
 	flag.Parse()
 
 	log := slog.Default()
-	cfg, err := bootstrap.LoadConfig(*configPath)
+	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
 		slog.Error("加载配置失败", "error", err.Error(), "path", *configPath)
 		os.Exit(1)

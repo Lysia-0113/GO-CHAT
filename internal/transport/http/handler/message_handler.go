@@ -8,26 +8,19 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/Lysia-0113/GO-CHAT/internal/errs"
-	"github.com/Lysia-0113/GO-CHAT/internal/infrastructure/redis"
 	"github.com/Lysia-0113/GO-CHAT/internal/message"
-	"github.com/Lysia-0113/GO-CHAT/internal/resilience"
+	"github.com/Lysia-0113/GO-CHAT/internal/svc"
 	"github.com/Lysia-0113/GO-CHAT/internal/transport/http/middleware"
 	"github.com/Lysia-0113/GO-CHAT/internal/transport/http/resp"
 )
 
 // MessageHandler 处理历史查询、离线补偿、已读与幂等查询。
 type MessageHandler struct {
-	messages        *message.Service
-	limiter         *redis.RateLimiter
-	historyBulkhead *resilience.Bulkhead
+	svcCtx *svc.ServiceContext
 }
 
-func NewMessageHandler(messages *message.Service, limiter *redis.RateLimiter, historyBulkhead *resilience.Bulkhead) *MessageHandler {
-	return &MessageHandler{
-		messages:        messages,
-		limiter:         limiter,
-		historyBulkhead: historyBulkhead,
-	}
+func NewMessageHandler(svcCtx *svc.ServiceContext) *MessageHandler {
+	return &MessageHandler{svcCtx: svcCtx}
 }
 
 // List 处理 GET /api/v1/conversations/{conversation_id}/messages
@@ -41,20 +34,20 @@ func (h *MessageHandler) List(c *gin.Context) {
 	userID := middleware.CurrentUserID(c)
 
 	// 历史查询限流（GOCHAT_RESILIENCE.md §5.2）
-	if h.limiter != nil {
-		if ok, retryAfter, _ := h.limiter.AllowHistory(c.Request.Context(), userID, convID, 20, 10); !ok {
+	if h.svcCtx.RateLimiter != nil {
+		if ok, retryAfter, _ := h.svcCtx.RateLimiter.AllowHistory(c.Request.Context(), userID, convID, 20, 10); !ok {
 			resp.Err(c, errs.Retryable(errs.RateLimited, "查询过于频繁", retryAfter))
 			return
 		}
 	}
 
 	// 隔离：历史查询独立并发池，不挤占持久化资源（GOCHAT_RESILIENCE.md §6.1）
-	if h.historyBulkhead != nil {
-		if err := h.historyBulkhead.Acquire(c.Request.Context()); err != nil {
+	if h.svcCtx.HistoryBulkhead != nil {
+		if err := h.svcCtx.HistoryBulkhead.Acquire(c.Request.Context()); err != nil {
 			resp.Err(c, err)
 			return
 		}
-		defer h.historyBulkhead.Release()
+		defer h.svcCtx.HistoryBulkhead.Release()
 	}
 
 	query := message.HistoryQuery{
@@ -68,7 +61,7 @@ func (h *MessageHandler) List(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 800*time.Millisecond)
 	defer cancel()
 
-	page, err := h.messages.ListHistory(ctx, query)
+	page, err := h.svcCtx.MessageService.ListHistory(ctx, query)
 	if err != nil {
 		resp.Err(c, err)
 		return
@@ -103,7 +96,7 @@ func (h *MessageHandler) MarkRead(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
 	defer cancel()
 
-	if err := h.messages.MarkRead(ctx, message.MarkReadCommand{
+	if err := h.svcCtx.MessageService.MarkRead(ctx, message.MarkReadCommand{
 		UserID:         middleware.CurrentUserID(c),
 		ConversationID: convID,
 		ReadSeq:        req.ReadSeq,
@@ -121,7 +114,7 @@ func (h *MessageHandler) GetByClientMessageID(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
 	defer cancel()
 
-	m, err := h.messages.GetByClientMessageID(ctx, middleware.CurrentUserID(c), clientMsgID)
+	m, err := h.svcCtx.MessageService.GetByClientMessageID(ctx, middleware.CurrentUserID(c), clientMsgID)
 	if err != nil {
 		resp.Err(c, err)
 		return

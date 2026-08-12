@@ -17,7 +17,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
-	"github.com/Lysia-0113/GO-CHAT/internal/bootstrap"
+	"github.com/Lysia-0113/GO-CHAT/internal/config"
 	"github.com/Lysia-0113/GO-CHAT/migrations"
 )
 
@@ -25,7 +25,7 @@ func main() {
 	dsn := flag.String("dsn", envOr("GOChat_MYSQL_DSN", ""), "MySQL DSN")
 	flag.Parse()
 	if *dsn == "" {
-		cfg, err := bootstrap.LoadConfig(envOr("GOChat_CONFIG", "./config/config.yaml"))
+		cfg, err := config.LoadConfig(envOr("GOChat_CONFIG", "./config/config.yaml"))
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "需要提供 -dsn 或 GOChat_MYSQL_DSN 环境变量")
 			os.Exit(1)

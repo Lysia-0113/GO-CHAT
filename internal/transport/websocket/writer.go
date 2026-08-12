@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/Lysia-0113/GO-CHAT/internal/connection"
+	"github.com/Lysia-0113/GO-CHAT/internal/metrics"
 )
 
 // writerLoop 是单连接写协程：从有界队列取事件写入 Socket
@@ -45,9 +46,7 @@ func (h *Handler) writerLoop(ctx context.Context, conn *Conn) {
 					"stall_ms", conn.StallDuration().Milliseconds(),
 					"queue_len", conn.QueueLen(),
 				)
-				if h.reg != nil {
-					h.reg.Counter("websocket_slow_connection_closed_total", "慢连接断开数", nil).Inc()
-				}
+				metrics.SlowConnectionClosed.Inc()
 				conn.Close("slow consumer")
 				return
 			}

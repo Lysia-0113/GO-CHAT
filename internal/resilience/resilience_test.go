@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/Lysia-0113/GO-CHAT/internal/errs"
-	"github.com/Lysia-0113/GO-CHAT/internal/metrics"
 )
 
 // TestBreakerOnlyCountsTechnicalFailures 只有技术失败计入熔断统计
@@ -17,7 +16,7 @@ func TestBreakerOnlyCountsTechnicalFailures(t *testing.T) {
 	// 场景 A：大量业务错误不应触发熔断
 	biz := NewBreakers([]BreakerConfig{
 		{Name: "redis:recent_get", Interval: time.Second, MinRequests: 3, FailureRatio: 0.5, OpenTimeout: 50 * time.Millisecond, HalfOpenMax: 1},
-	}, metrics.New())
+	})
 	for i := 0; i < 100; i++ {
 		err := biz.ExecuteByName(context.Background(), "redis:recent_get", func() error {
 			return errs.New(errs.ConversationForbidden, "无权")
@@ -33,7 +32,7 @@ func TestBreakerOnlyCountsTechnicalFailures(t *testing.T) {
 	// 场景 B：技术失败达到阈值 → Open，且 Open 期间不再调用依赖
 	tech := NewBreakers([]BreakerConfig{
 		{Name: "kafka:ingress_publish", Interval: time.Second, MinRequests: 3, FailureRatio: 0.5, OpenTimeout: 50 * time.Millisecond, HalfOpenMax: 1},
-	}, metrics.New())
+	})
 	for i := 0; i < 5; i++ {
 		_ = tech.ExecuteByName(context.Background(), "kafka:ingress_publish", func() error {
 			return errs.New(errs.KafkaUnavailable, "kafka down")
@@ -52,7 +51,7 @@ func TestBreakerOnlyCountsTechnicalFailures(t *testing.T) {
 func TestBreakerHalfOpenRecovery(t *testing.T) {
 	b := NewBreakers([]BreakerConfig{
 		{Name: "mysql:history_query", Interval: time.Second, MinRequests: 3, FailureRatio: 0.6, OpenTimeout: 100 * time.Millisecond, HalfOpenMax: 2},
-	}, metrics.New())
+	})
 
 	// 打满失败
 	for i := 0; i < 5; i++ {

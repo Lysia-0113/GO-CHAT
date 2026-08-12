@@ -6,65 +6,41 @@ package deliver
 import (
 	"context"
 	"encoding/json"
-	"log/slog"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/Lysia-0113/GO-CHAT/internal/connection"
-	"github.com/Lysia-0113/GO-CHAT/internal/conversation"
 	"github.com/Lysia-0113/GO-CHAT/internal/infrastructure/kafka"
 	redisinfra "github.com/Lysia-0113/GO-CHAT/internal/infrastructure/redis"
 	"github.com/Lysia-0113/GO-CHAT/internal/message"
 	"github.com/Lysia-0113/GO-CHAT/internal/metrics"
+	"github.com/Lysia-0113/GO-CHAT/internal/svc"
 )
 
-// Worker 是投递 Worker。
+// Worker 是投递 Worker。依赖经 svcCtx 服务定位器取用（GOCHAT_API.md §11.3）。
 type Worker struct {
-	consumer *kafka.Consumer
-	members  conversation.ConversationRepository
-	recent   message.RecentMessageCache
-	presence connection.PresenceRegistry
-	manager  *connection.Manager
-	pubsub   *redisinfra.PubsubGateway
-	dedup    *dedupe
-	reg      *metrics.Registry
-	log      *slog.Logger
+	svcCtx *svc.ServiceContext
+	dedup  *dedupe
 }
 
 // New 创建投递 Worker。
-// pubsub 为 nil 时只做本机推送（单节点模式）。
-func New(consumer *kafka.Consumer,
-	members conversation.ConversationRepository,
-	recent message.RecentMessageCache,
-	presence connection.PresenceRegistry,
-	manager *connection.Manager,
-	pubsub *redisinfra.PubsubGateway,
-	reg *metrics.Registry,
-	log *slog.Logger,
-) *Worker {
+func New(svcCtx *svc.ServiceContext) *Worker {
 	return &Worker{
-		consumer: consumer,
-		members:  members,
-		recent:   recent,
-		presence: presence,
-		manager:  manager,
-		pubsub:   pubsub,
-		dedup:    newDedupe(5 * time.Minute),
-		reg:      reg,
-		log:      log,
+		svcCtx: svcCtx,
+		dedup:  newDedupe(5 * time.Minute),
 	}
 }
 
 // Run 消费 im.message.persisted 直至 ctx 取消。
 func (w *Worker) Run(appCtx context.Context) error {
 	for {
-		msg, err := w.consumer.FetchMessage(appCtx)
+		msg, err := w.svcCtx.DeliverConsumer.FetchMessage(appCtx)
 		if err != nil {
 			if appCtx.Err() != nil {
 				return nil
 			}
-			w.log.Error("deliver fetch failed", "error", err.Error())
+			w.svcCtx.Log.Error("deliver fetch failed", "error", err.Error())
 			select {
 			case <-appCtx.Done():
 				return nil
@@ -74,7 +50,7 @@ func (w *Worker) Run(appCtx context.Context) error {
 		}
 		if err := w.handle(appCtx, msg); err != nil {
 			// 投递失败不提交 Offset：消息已在 MySQL，重复投递由 message_id 去重
-			w.log.Warn("deliver handle failed",
+			w.svcCtx.Log.Warn("deliver handle failed",
 				"partition", msg.Partition, "offset", msg.Offset, "error", err.Error())
 		}
 	}
@@ -84,22 +60,22 @@ func (w *Worker) Run(appCtx context.Context) error {
 func (w *Worker) handle(ctx context.Context, msg kafka.Message) error {
 	var env kafka.Envelope
 	if err := json.Unmarshal(msg.Value, &env); err != nil {
-		return w.consumer.CommitMessages(ctx, msg)
+		return w.svcCtx.DeliverConsumer.CommitMessages(ctx, msg)
 	}
 	var event message.MessagePersistedEvent
 	if err := json.Unmarshal(env.Data, &event); err != nil {
-		return w.consumer.CommitMessages(ctx, msg)
+		return w.svcCtx.DeliverConsumer.CommitMessages(ctx, msg)
 	}
 
 	// 1. 按 message_id 短期幂等（Outbox 可能重复投递）
 	if w.dedup.Seen(event.MessageID) {
-		return w.consumer.CommitMessages(ctx, msg)
+		return w.svcCtx.DeliverConsumer.CommitMessages(ctx, msg)
 	}
 	w.dedup.Mark(event.MessageID)
 
 	// 2. 更新最近消息缓存；失败不回滚 MySQL（GOCHAT_REDIS.md §4.5）
-	if w.recent != nil {
-		if err := w.recent.Append(ctx, &message.Message{
+	if w.svcCtx.RecentCache != nil {
+		if err := w.svcCtx.RecentCache.Append(ctx, &message.Message{
 			MessageID:       event.MessageID,
 			ClientMessageID: event.ClientMessageID,
 			ConversationID:  event.ConversationID,
@@ -110,15 +86,13 @@ func (w *Worker) handle(ctx context.Context, msg kafka.Message) error {
 			Status:          message.StatusNormal,
 			CreatedAt:       event.CreatedAt,
 		}); err != nil {
-			w.log.Warn("recent cache append failed", "message_id", event.MessageID, "error", err.Error())
-			if w.reg != nil {
-				w.reg.Counter(metrics.NameRecentCacheFallback, "缓存回源次数", nil).Inc()
-			}
+			w.svcCtx.Log.Warn("recent cache append failed", "message_id", event.MessageID, "error", err.Error())
+			metrics.RecentCacheFallback.Inc()
 		}
 	}
 
 	// 3. 成员 fanout：发送者收 message.persisted，接收者收 message.new
-	memberIDs, err := w.members.ListMemberIDs(ctx, event.ConversationID)
+	memberIDs, err := w.svcCtx.ConvRepo.ListMemberIDs(ctx, event.ConversationID)
 	if err != nil {
 		return err
 	}
@@ -127,17 +101,15 @@ func (w *Worker) handle(ctx context.Context, msg kafka.Message) error {
 	}
 
 	// 4. 提交 Offset
-	return w.consumer.CommitMessages(ctx, msg)
+	return w.svcCtx.DeliverConsumer.CommitMessages(ctx, msg)
 }
 
 // pushToMember 向成员的全部在线连接投递（本机直推或跨节点 Pub/Sub）。
 func (w *Worker) pushToMember(ctx context.Context, event message.MessagePersistedEvent, memberID int64) {
-	routes, err := w.presence.OnlineConnections(ctx, memberID)
+	routes, err := w.svcCtx.Presence.OnlineConnections(ctx, memberID)
 	if err != nil {
 		// 在线查询失败：投递缺口主嫌疑（之前被静默吞掉）
-		if w.reg != nil {
-			w.reg.Counter(metrics.NameOnlineQueryFailed, "在线状态查询失败数", nil).Inc()
-		}
+		metrics.OnlineQueryFailed.Inc()
 		return
 	}
 	if len(routes) == 0 {
@@ -146,24 +118,22 @@ func (w *Worker) pushToMember(ctx context.Context, event message.MessagePersiste
 
 	ev, err := eventForMember(event, memberID)
 	if err != nil {
-		w.log.Error("build push event failed", "error", err.Error())
+		w.svcCtx.Log.Error("build push event failed", "error", err.Error())
 		return
 	}
 
 	for _, route := range routes {
-		if route.NodeID == w.manager.NodeID() {
+		if route.NodeID == w.svcCtx.ConnManager.NodeID() {
 			// 本机连接直推
-			if err := w.manager.PushToConnection(ctx, route.ConnectionID, ev); err != nil {
-				if w.reg != nil {
-					w.reg.Counter(metrics.NamePushToConnFailed, "投递推送失败数", nil).Inc()
-				}
+			if err := w.svcCtx.ConnManager.PushToConnection(ctx, route.ConnectionID, ev); err != nil {
+				metrics.PushToConnFailed.Inc()
 			}
 			continue
 		}
-		if w.pubsub != nil {
+		if w.svcCtx.Pubsub != nil {
 			// 跨节点：发布到目标节点频道（丢失后客户端补拉）
 			raw, _ := json.Marshal(ev)
-			_ = w.pubsub.PublishToNode(ctx, route.NodeID, redisinfra.DeliveryEvent{
+			_ = w.svcCtx.Pubsub.PublishToNode(ctx, route.NodeID, redisinfra.DeliveryEvent{
 				EventName:     ev.Event,
 				Data:          raw,
 				ConnectionIDs: []string{route.ConnectionID},

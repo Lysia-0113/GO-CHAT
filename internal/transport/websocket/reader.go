@@ -21,8 +21,8 @@ func (h *Handler) readerLoop(connCtx context.Context, conn *Conn) {
 			return
 		}
 		// 单连接入站事件限流（GOCHAT_RESILIENCE.md §5.2）
-		if h.limiter != nil {
-			if ok, _, _ := h.limiter.AllowConnInbound(connCtx, connKey, float64(h.inboundRateBurst), h.inboundRatePerSec); !ok {
+		if h.svcCtx.RateLimiter != nil {
+			if ok, _, _ := h.svcCtx.RateLimiter.AllowConnInbound(connCtx, connKey, float64(h.inboundRateBurst), h.inboundRatePerSec); !ok {
 				// 持续恶意超额：关闭连接
 				h.log.Warn("connection inbound rate limited, closing", "connection_id", conn.ID())
 				conn.Close("inbound rate limited")
@@ -70,9 +70,7 @@ func (h *Handler) dispatch(ctx context.Context, conn *Conn, raw []byte) {
 
 // onSend 处理 message.send（GOCHAT_API.md §6.5）。
 func (h *Handler) onSend(ctx context.Context, conn *Conn, env inbound) {
-	if h.reg != nil {
-		h.reg.Counter(metrics.NameWSIngressReceived, "收到的 message.send 总数", nil).Inc()
-	}
+	metrics.WSIngressReceived.Inc()
 	payload, err := parseSend(env.Data)
 	if err != nil {
 		h.writeError(conn, env.RequestID, err)
@@ -89,7 +87,7 @@ func (h *Handler) onSend(ctx context.Context, conn *Conn, env inbound) {
 		return
 	}
 
-	result, err := h.messages.Send(ctx, message.SendMessageCommand{
+	result, err := h.svcCtx.MessageService.Send(ctx, message.SendMessageCommand{
 		SenderID:        conn.UserID(),
 		ClientMessageID: payload.ClientMessageID,
 		ConversationID:  convID,
@@ -99,9 +97,7 @@ func (h *Handler) onSend(ctx context.Context, conn *Conn, env inbound) {
 	})
 	if err != nil {
 		// 发布失败：计数 + 日志（客户端靠 error 事件 + 幂等重试兜底）
-		if h.reg != nil {
-			h.reg.Counter(metrics.NamePublishFailed, "Kafka 发布失败数", nil).Inc()
-		}
+		metrics.PublishFailed.Inc()
 		h.log.Error("publish failed",
 			"client_msg_id", payload.ClientMessageID,
 			"error", err.Error(),
@@ -119,9 +115,7 @@ func (h *Handler) onSend(ctx context.Context, conn *Conn, env inbound) {
 	if eerr == nil {
 		event.RequestID = env.RequestID
 		if err := conn.Push(ctx, event); err != nil {
-			if h.reg != nil {
-				h.reg.Counter(metrics.NamePushDropped, "回执推送丢弃数", nil).Inc()
-			}
+			metrics.PushDropped.Inc()
 		}
 	}
 }
@@ -138,7 +132,7 @@ func (h *Handler) onReceivedAck(ctx context.Context, conn *Conn, env inbound) {
 		h.writeError(conn, env.RequestID, err)
 		return
 	}
-	if err := h.messages.AckReceived(ctx, message.AckReceivedCommand{
+	if err := h.svcCtx.MessageService.AckReceived(ctx, message.AckReceivedCommand{
 		UserID:         conn.UserID(),
 		ConversationID: convID,
 		ReceivedSeq:    payload.ReceivedSeq,
@@ -160,7 +154,7 @@ func (h *Handler) onConversationRead(ctx context.Context, conn *Conn, env inboun
 		h.writeError(conn, env.RequestID, err)
 		return
 	}
-	if err := h.messages.MarkRead(ctx, message.MarkReadCommand{
+	if err := h.svcCtx.MessageService.MarkRead(ctx, message.MarkReadCommand{
 		UserID:         conn.UserID(),
 		ConversationID: convID,
 		ReadSeq:        payload.ReadSeq,
@@ -174,7 +168,7 @@ func (h *Handler) onConversationRead(ctx context.Context, conn *Conn, env inboun
 
 // notifyRead 向其他成员推送已读事件（尽力而为）。
 func (h *Handler) notifyRead(ctx context.Context, conversationID, readSeq, readerID int64) {
-	memberIDs, err := h.convos.ListMemberIDs(ctx, conversationID)
+	memberIDs, err := h.svcCtx.ConversationService.ListMemberIDs(ctx, conversationID)
 	if err != nil {
 		return
 	}
@@ -190,24 +184,24 @@ func (h *Handler) notifyRead(ctx context.Context, conversationID, readSeq, reade
 		if memberID == readerID {
 			continue
 		}
-		h.manager.PushToUser(ctx, memberID, event)
+		h.svcCtx.ConnManager.PushToUser(ctx, memberID, event)
 	}
 }
 
 // refreshPresence 心跳续期（GOCHAT_REDIS.md §5.3）。
 func (h *Handler) refreshPresence(ctx context.Context, conn *Conn) {
-	if h.presence == nil {
+	if h.svcCtx.Presence == nil {
 		return
 	}
 	route := connection.ConnectionRoute{
 		ConnectionID: conn.ID(),
 		UserID:       conn.UserID(),
 		DeviceID:     conn.DeviceID(),
-		NodeID:       h.manager.NodeID(),
+		NodeID:       h.svcCtx.ConnManager.NodeID(),
 	}
 	ctx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
 	defer cancel()
-	_ = h.presence.Heartbeat(ctx, route)
+	_ = h.svcCtx.Presence.Heartbeat(ctx, route)
 }
 
 // writeError 发送 error 事件（GOCHAT_API.md §6.9）。
@@ -228,8 +222,6 @@ func (h *Handler) writeError(conn *Conn, requestID string, err error) {
 	event.RequestID = requestID
 	if err := conn.Push(context.Background(), event); err != nil {
 		// 错误告知本身也可能被丢弃：客户端靠超时 + 幂等重试兜底
-		if h.reg != nil {
-			h.reg.Counter(metrics.NamePushDropped, "回执推送丢弃数", nil).Inc()
-		}
+		metrics.PushDropped.Inc()
 	}
 }

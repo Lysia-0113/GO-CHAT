@@ -1,200 +1,178 @@
-// Package metrics 提供轻量级进程内指标注册表，以 Prometheus 文本格式暴露。
+// Package metrics 定义全部可观测指标，基于官方 prometheus/client_golang。
 //
-// P0 只需要计数器和仪表盘两类指标；标签维度来自配置的固定键集合，
-// 避免生产环境标签爆炸。实现线程安全，不依赖外部服务。
+// 设计约定：
+//   - 所有指标在启动前声明为全局变量（编译期固定，运行时不新建）；
+//   - 无标签指标用 NewCounter/NewGauge，直接 Inc()/Set()；
+//   - 带标签指标用 New*Vec，标签键在定义时声明，调用只给值
+//     （WithLabelValues），拼错在编译期暴露；
+//   - 名字合法性、同名冲突由注册时校验（MustRegister 失败直接 panic）。
+//
+// 指标清单对应 GOCHAT_RESILIENCE.md §11.1 / GOCHAT_KAFKA.md §11.2。
 package metrics
 
 import (
-	"fmt"
-	"sort"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
+	"net/http"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// Metric 是带标签的指标值。
-type Metric struct {
-	Name   string
-	Help   string
-	Labels map[string]string
-}
+// ---- 计数器（只增不减，名字以 _total 结尾是 Prometheus 约定）----
 
-func (m Metric) key() string {
-	return m.Name + "{" + labelKey(m.Labels) + "}"
-}
-
-func labelKey(labels map[string]string) string {
-	keys := make([]string, 0, len(labels))
-	for k := range labels {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	var b strings.Builder
-	for _, k := range keys {
-		if b.Len() > 0 {
-			b.WriteString(",")
-		}
-		b.WriteString(k)
-		b.WriteString("=")
-		b.WriteString(labels[k])
-	}
-	return b.String()
-}
-
-func labelString(labels map[string]string) string {
-	if len(labels) == 0 {
-		return ""
-	}
-	keys := make([]string, 0, len(labels))
-	for k := range labels {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	var b strings.Builder
-	b.WriteString("{")
-	for i, k := range keys {
-		if i > 0 {
-			b.WriteString(",")
-		}
-		fmt.Fprintf(&b, "%s=%q", k, labels[k])
-	}
-	b.WriteString("}")
-	return b.String()
-}
-
-// Registry 保存全部指标。
-type Registry struct {
-	mu       sync.RWMutex
-	counters map[string]*counter
-	gauges   map[string]*gauge
-}
-
-type counter struct {
-	metric Metric
-	value  atomic.Int64
-}
-
-type gauge struct {
-	metric Metric
-	value  atomic.Int64
-}
-
-// New 创建空指标注册表。
-func New() *Registry {
-	return &Registry{
-		counters: make(map[string]*counter),
-		gauges:   make(map[string]*gauge),
-	}
-}
-
-// Counter 获取（或创建）一个计数器。
-func (r *Registry) Counter(name, help string, labels map[string]string) *Counter {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	m := Metric{Name: name, Help: help, Labels: labels}
-	k := m.key()
-	c, ok := r.counters[k]
-	if !ok {
-		c = &counter{metric: m}
-		r.counters[k] = c
-	}
-	return &Counter{c}
-}
-
-// Gauge 获取（或创建）一个仪表盘。
-func (r *Registry) Gauge(name, help string, labels map[string]string) *Gauge {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	m := Metric{Name: name, Help: help, Labels: labels}
-	k := m.key()
-	g, ok := r.gauges[k]
-	if !ok {
-		g = &gauge{metric: m}
-		r.gauges[k] = g
-	}
-	return &Gauge{g}
-}
-
-// Render 输出 Prometheus 文本格式。
-func (r *Registry) Render() string {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	var b strings.Builder
-	counters := make([]*counter, 0, len(r.counters))
-	for _, c := range r.counters {
-		counters = append(counters, c)
-	}
-	sort.Slice(counters, func(i, j int) bool { return counters[i].metric.key() < counters[j].metric.key() })
-	for _, c := range counters {
-		writeMetric(&b, c.metric, "counter", float64(c.value.Load()))
-	}
-	gauges := make([]*gauge, 0, len(r.gauges))
-	for _, g := range r.gauges {
-		gauges = append(gauges, g)
-	}
-	sort.Slice(gauges, func(i, j int) bool { return gauges[i].metric.key() < gauges[j].metric.key() })
-	for _, g := range gauges {
-		writeMetric(&b, g.metric, "gauge", float64(g.value.Load()))
-	}
-	return b.String()
-}
-
-func writeMetric(b *strings.Builder, m Metric, typ string, value float64) {
-	fmt.Fprintf(b, "# HELP %s %s\n", m.Name, m.Help)
-	fmt.Fprintf(b, "# TYPE %s %s\n", m.Name, typ)
-	fmt.Fprintf(b, "%s%s %v\n", m.Name, labelString(m.Labels), value)
-}
-
-// Counter 的递增接口。
-type Counter struct{ c *counter }
-
-func (c *Counter) Inc()         { c.c.value.Add(1) }
-func (c *Counter) Add(n int64)  { c.c.value.Add(n) }
-func (c *Counter) Value() int64 { return c.c.value.Load() }
-
-// Gauge 的设置接口。
-type Gauge struct{ g *gauge }
-
-func (g *Gauge) Set(v int64)  { g.g.value.Store(v) }
-func (g *Gauge) Add(v int64)  { g.g.value.Add(v) }
-func (g *Gauge) Value() int64 { return g.g.value.Load() }
-
-// 常用辅助指标命名（与 GOCHAT_RESILIENCE.md §11.1 / GOCHAT_KAFKA.md §11.2 对齐）。
-const (
-	NameRateLimitRejected      = "rate_limit_rejected_total"
-	NameBreakerState           = "breaker_state"
-	NameDependencyTimeout      = "dependency_timeout_total"
-	NameBulkheadQueueLength    = "bulkhead_queue_length"
-	NameBulkheadRejected       = "bulkhead_rejected_total"
-	NameWSWriteQueueLength     = "websocket_write_queue_length"
-	NameWSWriteQueueFull       = "websocket_write_queue_full_total"
-	NameOutboxPending          = "outbox_pending_count"
-	NameOutboxOldestAge        = "outbox_oldest_age_seconds"
-	NameOutboxPublishError     = "outbox_publish_error_total"
-	NameIDSegmentRemaining     = "id_segment_remaining"
-	NamePersistSuccess         = "persist_success_total"
-	NamePersistRetry           = "persist_retry_total"
-	NamePersistIdempotent      = "persist_idempotent_total"
-	NameRecentCacheHit         = "recent_cache_hit_total"
-	NameRecentCacheFallback    = "recent_cache_fallback_total"
-	NameWSConnectionActive     = "websocket_connection_active"
-	NamePresenceStaleCleanup   = "presence_stale_cleanup_total"
-	NameWSTicketCreated        = "ws_ticket_created_total"
-	NameWSTicketConsumed       = "ws_ticket_consumed_total"
-	NameWSTicketReplayRejected = "ws_ticket_replay_rejected_total"
-	NameIdemFastHit            = "idem_fast_hit_total"
-	NameKafkaDLQ               = "kafka_dlq_total"
-
-	// 可观测性补充（2026-08 压测埋点）：消息管线每站一个计数器
-	NameWSIngressReceived = "ws_ingress_received_total"
-	NamePublishFailed     = "publish_failed_total"
-	NamePushDropped       = "push_dropped_total"
-	NameCloseReason       = "close_reason_total"
-	NameOnlineQueryFailed = "online_query_failed_total"
-	NamePushToConnFailed  = "push_to_connection_failed_total"
+// RateLimitRejected 限流拒绝数（按 key_type 区分维度）。
+var RateLimitRejected = prometheus.NewCounterVec(
+	prometheus.CounterOpts{Name: "rate_limit_rejected_total", Help: "限流拒绝数"},
+	[]string{"key_type"},
 )
 
-// NowUnix 供外部记录时间戳。
-func NowUnix() float64 { return float64(time.Now().UnixNano()) / 1e9 }
+// RateLimitL1Fallback 本地限流降级次数。
+var RateLimitL1Fallback = prometheus.NewCounter(
+	prometheus.CounterOpts{Name: "rate_limit_l1_fallback_total", Help: "本地限流降级次数"},
+)
+
+// WSTicketCreated 票据创建数。
+var WSTicketCreated = prometheus.NewCounter(
+	prometheus.CounterOpts{Name: "ws_ticket_created_total", Help: "票据创建数"},
+)
+
+// WSTicketReplayRejected 票据重放拒绝数。
+var WSTicketReplayRejected = prometheus.NewCounter(
+	prometheus.CounterOpts{Name: "ws_ticket_replay_rejected_total", Help: "票据重放拒绝数"},
+)
+
+// CloseReason 连接关闭原因分布。
+var CloseReason = prometheus.NewCounterVec(
+	prometheus.CounterOpts{Name: "close_reason_total", Help: "连接关闭原因"},
+	[]string{"reason"},
+)
+
+// WSIngressReceived 收到的 message.send 总数。
+var WSIngressReceived = prometheus.NewCounter(
+	prometheus.CounterOpts{Name: "ws_ingress_received_total", Help: "收到的 message.send 总数"},
+)
+
+// PublishFailed Kafka 发布失败数。
+var PublishFailed = prometheus.NewCounter(
+	prometheus.CounterOpts{Name: "publish_failed_total", Help: "Kafka 发布失败数"},
+)
+
+// PushDropped 回执推送丢弃数。
+var PushDropped = prometheus.NewCounter(
+	prometheus.CounterOpts{Name: "push_dropped_total", Help: "回执推送丢弃数"},
+)
+
+// SlowConnectionClosed 慢连接断开数。
+var SlowConnectionClosed = prometheus.NewCounter(
+	prometheus.CounterOpts{Name: "websocket_slow_connection_closed_total", Help: "慢连接断开数"},
+)
+
+// KafkaProducerError 生产者失败数（按 topic 区分维度）。
+var KafkaProducerError = prometheus.NewCounterVec(
+	prometheus.CounterOpts{Name: "kafka_producer_error_total", Help: "生产者失败数"},
+	[]string{"topic"},
+)
+
+// KafkaProducerSend 生产者发送总数。
+var KafkaProducerSend = prometheus.NewCounterVec(
+	prometheus.CounterOpts{Name: "kafka_producer_send_total", Help: "生产者发送总数"},
+	[]string{"topic"},
+)
+
+// PersistSuccess 持久化成功数。
+var PersistSuccess = prometheus.NewCounter(
+	prometheus.CounterOpts{Name: "persist_success_total", Help: "持久化成功数"},
+)
+
+// PersistRetry 持久化重试次数。
+var PersistRetry = prometheus.NewCounter(
+	prometheus.CounterOpts{Name: "persist_retry_total", Help: "持久化重试次数"},
+)
+
+// PersistIdempotent 重复消费命中。
+var PersistIdempotent = prometheus.NewCounter(
+	prometheus.CounterOpts{Name: "persist_idempotent_total", Help: "重复消费命中"},
+)
+
+// KafkaDLQ 进入死信的事件数。
+var KafkaDLQ = prometheus.NewCounterVec(
+	prometheus.CounterOpts{Name: "kafka_dlq_total", Help: "进入死信的事件数"},
+	[]string{"topic"},
+)
+
+// RecentCacheFallback 缓存回源次数。
+var RecentCacheFallback = prometheus.NewCounter(
+	prometheus.CounterOpts{Name: "recent_cache_fallback_total", Help: "缓存回源次数"},
+)
+
+// OnlineQueryFailed 在线状态查询失败数。
+var OnlineQueryFailed = prometheus.NewCounter(
+	prometheus.CounterOpts{Name: "online_query_failed_total", Help: "在线状态查询失败数"},
+)
+
+// PushToConnFailed 投递推送失败数。
+var PushToConnFailed = prometheus.NewCounter(
+	prometheus.CounterOpts{Name: "push_to_connection_failed_total", Help: "投递推送失败数"},
+)
+
+// OutboxPublishError Outbox 发布失败数。
+var OutboxPublishError = prometheus.NewCounter(
+	prometheus.CounterOpts{Name: "outbox_publish_error_total", Help: "Outbox 发布失败数"},
+)
+
+// ---- 仪表盘（可上可下，当前值）----
+
+// WSConnectionActive 在线连接数。
+var WSConnectionActive = prometheus.NewGauge(
+	prometheus.GaugeOpts{Name: "websocket_connection_active", Help: "在线连接数"},
+)
+
+// IDSegmentRemaining 号段剩余库存（按 biz_tag 与节点区分维度）。
+var IDSegmentRemaining = prometheus.NewGaugeVec(
+	prometheus.GaugeOpts{Name: "id_segment_remaining", Help: "号段剩余库存"},
+	[]string{"biz_tag", "node"},
+)
+
+// BreakerState 熔断器状态 0=closed 1=open 2=half-open。
+var BreakerState = prometheus.NewGaugeVec(
+	prometheus.GaugeOpts{Name: "breaker_state", Help: "熔断器状态 0=closed 1=open 2=half-open"},
+	[]string{"dependency"},
+)
+
+// BulkheadQueueLength 隔离舱占用（按 worker 区分维度）。
+var BulkheadQueueLength = prometheus.NewGaugeVec(
+	prometheus.GaugeOpts{Name: "bulkhead_queue_length", Help: "隔离舱占用"},
+	[]string{"worker"},
+)
+
+// OutboxPending 待投递 Outbox 数量。
+var OutboxPending = prometheus.NewGaugeVec(
+	prometheus.GaugeOpts{Name: "outbox_pending_count", Help: "待投递 Outbox 数量"},
+	[]string{"event_type"},
+)
+
+// OutboxOldestAge 最老待投递记录年龄（秒）。
+var OutboxOldestAge = prometheus.NewGaugeVec(
+	prometheus.GaugeOpts{Name: "outbox_oldest_age_seconds", Help: "最老待投递记录年龄"},
+	[]string{"event_type"},
+)
+
+// New 创建注册表并注册全部指标（启动时调用一次）。
+func New() *prometheus.Registry {
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(
+		RateLimitRejected, RateLimitL1Fallback,
+		WSTicketCreated, WSTicketReplayRejected, CloseReason,
+		WSIngressReceived, PublishFailed, PushDropped, SlowConnectionClosed,
+		KafkaProducerError, KafkaProducerSend,
+		PersistSuccess, PersistRetry, PersistIdempotent, KafkaDLQ,
+		RecentCacheFallback, OnlineQueryFailed, PushToConnFailed, OutboxPublishError,
+		WSConnectionActive, IDSegmentRemaining, BreakerState, BulkheadQueueLength,
+		OutboxPending, OutboxOldestAge,
+	)
+	return reg
+}
+
+// Handler 返回标准 /metrics HTTP 处理器（promhttp 自带 Content-Type 与编码）。
+func Handler(reg *prometheus.Registry) http.Handler {
+	return promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
+}

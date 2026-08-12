@@ -22,7 +22,6 @@ type Producer struct {
 	writer   *kafkago.Writer
 	breakers *resilience.Breakers
 	timeout  time.Duration
-	reg      *metrics.Registry
 
 	producerName string
 }
@@ -38,7 +37,7 @@ type ProducerConfig struct {
 
 // NewProducer 创建生产者。
 // 单 Writer 按 Topic 复用连接；分区平衡使用 Hash（同 Key 同 Partition，保证会话顺序）。
-func NewProducer(cfg ProducerConfig, breakers *resilience.Breakers, reg *metrics.Registry, producerName string) (*Producer, error) {
+func NewProducer(cfg ProducerConfig, breakers *resilience.Breakers, producerName string) (*Producer, error) {
 	acks := kafkago.RequireAll
 	if !cfg.AcksAll {
 		acks = kafkago.RequireOne
@@ -63,7 +62,6 @@ func NewProducer(cfg ProducerConfig, breakers *resilience.Breakers, reg *metrics
 		writer:       writer,
 		breakers:     breakers,
 		timeout:      cfg.Timeout,
-		reg:          reg,
 		producerName: producerName,
 	}, nil
 }
@@ -111,14 +109,10 @@ func (p *Producer) publish(ctx context.Context, topic string, env Envelope) erro
 		return p.Publish(ctx, topic, convID, env)
 	})
 	if err != nil {
-		if p.reg != nil {
-			p.reg.Counter("kafka_producer_error_total", "生产者失败数", map[string]string{"topic": topic}).Inc()
-		}
+		metrics.KafkaProducerError.WithLabelValues(topic).Inc()
 		return errs.Wrap(errs.KafkaUnavailable, "Kafka 发布失败", err)
 	}
-	if p.reg != nil {
-		p.reg.Counter("kafka_producer_send_total", "生产者发送总数", map[string]string{"topic": topic}).Inc()
-	}
+	metrics.KafkaProducerSend.WithLabelValues(topic).Inc()
 	return nil
 }
 

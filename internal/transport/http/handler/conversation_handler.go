@@ -9,17 +9,18 @@ import (
 
 	"github.com/Lysia-0113/GO-CHAT/internal/conversation"
 	"github.com/Lysia-0113/GO-CHAT/internal/errs"
+	"github.com/Lysia-0113/GO-CHAT/internal/svc"
 	"github.com/Lysia-0113/GO-CHAT/internal/transport/http/middleware"
 	"github.com/Lysia-0113/GO-CHAT/internal/transport/http/resp"
 )
 
 // ConversationHandler 处理会话创建与查询。
 type ConversationHandler struct {
-	convos *conversation.Service
+	svcCtx *svc.ServiceContext
 }
 
-func NewConversationHandler(convos *conversation.Service) *ConversationHandler {
-	return &ConversationHandler{convos: convos}
+func NewConversationHandler(svcCtx *svc.ServiceContext) *ConversationHandler {
+	return &ConversationHandler{svcCtx: svcCtx}
 }
 
 // Create 处理 POST /api/v1/conversations（GOCHAT_API.md §5.5）。
@@ -48,7 +49,7 @@ func (h *ConversationHandler) Create(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
 	defer cancel()
 
-	conv, created, err := h.convos.Create(ctx, conversation.CreateConversationCommand{
+	conv, created, err := h.svcCtx.ConversationService.Create(ctx, conversation.CreateConversationCommand{
 		SenderID:  middleware.CurrentUserID(c),
 		Type:      convType,
 		Name:      req.Name,
@@ -71,7 +72,7 @@ func (h *ConversationHandler) List(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
 	defer cancel()
 
-	page, err := h.convos.List(ctx, middleware.CurrentUserID(c), c.Query("cursor"), atoiDefault(c.Query("limit"), 20))
+	page, err := h.svcCtx.ConversationService.List(ctx, middleware.CurrentUserID(c), c.Query("cursor"), atoiDefault(c.Query("limit"), 20))
 	if err != nil {
 		resp.Err(c, err)
 		return
@@ -97,7 +98,7 @@ func (h *ConversationHandler) Get(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
 	defer cancel()
 
-	conv, err := h.convos.Get(ctx, middleware.CurrentUserID(c), convID)
+	conv, err := h.svcCtx.ConversationService.Get(ctx, middleware.CurrentUserID(c), convID)
 	if err != nil {
 		resp.Err(c, err)
 		return

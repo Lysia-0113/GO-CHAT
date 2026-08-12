@@ -10,7 +10,6 @@ import (
 	"github.com/sony/gobreaker"
 
 	"github.com/Lysia-0113/GO-CHAT/internal/errs"
-	"github.com/Lysia-0113/GO-CHAT/internal/metrics"
 )
 
 // BreakerConfig 是单个熔断器配置（GOCHAT_RESILIENCE.md §7.3）。
@@ -25,16 +24,14 @@ type BreakerConfig struct {
 
 // Breakers 是进程内全部熔断器的注册表。
 type Breakers struct {
-	mu  sync.RWMutex
-	m   map[string]*Breaker
-	reg *metrics.Registry
+	mu sync.RWMutex
+	m  map[string]*Breaker
 }
 
 // NewBreakers 按配置创建熔断器集合。
-func NewBreakers(configs []BreakerConfig, reg *metrics.Registry) *Breakers {
+func NewBreakers(configs []BreakerConfig) *Breakers {
 	b := &Breakers{
-		m:   make(map[string]*Breaker, len(configs)),
-		reg: reg,
+		m: make(map[string]*Breaker, len(configs)),
 	}
 	for _, c := range configs {
 		b.m[c.Name] = newBreaker(c)

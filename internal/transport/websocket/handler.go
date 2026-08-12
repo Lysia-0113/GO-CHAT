@@ -2,7 +2,6 @@ package websocket
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 	"net/http"
 	"time"
@@ -12,23 +11,19 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/Lysia-0113/GO-CHAT/internal/connection"
-	"github.com/Lysia-0113/GO-CHAT/internal/conversation"
-	"github.com/Lysia-0113/GO-CHAT/internal/infrastructure/redis"
-	"github.com/Lysia-0113/GO-CHAT/internal/message"
 	"github.com/Lysia-0113/GO-CHAT/internal/metrics"
+	"github.com/Lysia-0113/GO-CHAT/internal/svc"
 	"github.com/Lysia-0113/GO-CHAT/internal/transport/http/middleware"
 )
 
 // Handler 是 WebSocket 入口：Ticket 升级、读写循环、心跳与事件分发
 // （GOCHAT_API.md §6 / GOCHAT_REDIS.md §6）。
+//
+// 依赖获取（GOCHAT_API.md §11.3）：Handler 持有 svcCtx 服务定位器，
+// 方法内经 h.svcCtx.Xxx 取用；appCtx 是进程级生命周期 ctx（非请求 ctx）。
 type Handler struct {
-	appCtx   context.Context
-	tickets  *redis.WSTicketStore
-	limiter  *redis.RateLimiter
-	manager  *connection.Manager
-	presence connection.PresenceRegistry
-	messages *message.Service
-	convos   *conversation.Service
+	appCtx context.Context
+	svcCtx *svc.ServiceContext
 
 	readLimit         int64
 	heartbeatInterval time.Duration
@@ -41,7 +36,6 @@ type Handler struct {
 	wsConnectPerMinute     int
 	wsConnectPerUserMinute int
 
-	reg *metrics.Registry
 	log *slog.Logger
 }
 
@@ -61,24 +55,13 @@ type HandlerConfig struct {
 // NewHandler 创建 WebSocket Handler。
 func NewHandler(
 	appCtx context.Context,
-	tickets *redis.WSTicketStore,
-	limiter *redis.RateLimiter,
-	manager *connection.Manager,
-	presence connection.PresenceRegistry,
-	messages *message.Service,
-	convos *conversation.Service,
+	svcCtx *svc.ServiceContext,
 	cfg HandlerConfig,
-	reg *metrics.Registry,
 	log *slog.Logger,
 ) *Handler {
 	return &Handler{
 		appCtx:                 appCtx,
-		tickets:                tickets,
-		limiter:                limiter,
-		manager:                manager,
-		presence:               presence,
-		messages:               messages,
-		convos:                 convos,
+		svcCtx:                 svcCtx,
 		readLimit:              cfg.ReadLimit,
 		heartbeatInterval:      cfg.HeartbeatInterval,
 		missedHeartbeat:        cfg.MissedHeartbeat,
@@ -88,7 +71,6 @@ func NewHandler(
 		inboundRateBurst:       cfg.InboundRateBurst,
 		wsConnectPerMinute:     cfg.WSConnectPerMinute,
 		wsConnectPerUserMinute: cfg.WSConnectPerUserMinute,
-		reg:                    reg,
 		log:                    log,
 	}
 }
@@ -117,15 +99,13 @@ func (h *Handler) CreateTicket(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 500*time.Millisecond)
 	defer cancel()
 
-	token, err := h.tickets.Create(ctx, userID, req.DeviceID)
+	token, err := h.svcCtx.WSTickets.Create(ctx, userID, req.DeviceID)
 	if err != nil {
 		// Redis 故障：返回 503，不回退为长期 JWT URL（GOCHAT_REDIS.md §6.3）
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "票据服务暂不可用"})
 		return
 	}
-	if h.reg != nil {
-		h.reg.Counter(metrics.NameWSTicketCreated, "票据创建数", nil).Inc()
-	}
+	metrics.WSTicketCreated.Inc()
 	c.JSON(http.StatusOK, gin.H{
 		"request_id": getRequestID(c),
 		"data": gin.H{
@@ -143,27 +123,25 @@ func (h *Handler) Upgrade(c *gin.Context) {
 	defer cancel()
 
 	// 1. 一次性票据消费（GETDEL 原子读取并删除）
-	ticket, err := h.tickets.Consume(ctx, token)
+	ticket, err := h.svcCtx.WSTickets.Consume(ctx, token)
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "票据服务暂不可用"})
 		return
 	}
 	if ticket == nil {
 		// 票据不存在或已被消费：拒绝连接（重放被拒绝）
-		if h.reg != nil {
-			h.reg.Counter(metrics.NameWSTicketReplayRejected, "票据重放拒绝数", nil).Inc()
-		}
+		metrics.WSTicketReplayRejected.Inc()
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "票据无效或已使用"})
 		return
 	}
 
 	// 2. 建连限流（IP + 用户维度，GOCHAT_RESILIENCE.md §5.2）
 	ip := c.ClientIP()
-	if ok, _, _ := h.limiter.AllowWSConnectIP(ctx, ip, h.wsConnectPerMinute); !ok {
+	if ok, _, _ := h.svcCtx.RateLimiter.AllowWSConnectIP(ctx, ip, h.wsConnectPerMinute); !ok {
 		c.JSON(http.StatusTooManyRequests, gin.H{"error": "连接过于频繁"})
 		return
 	}
-	if ok, _, _ := h.limiter.AllowWSConnectUser(ctx, ticket.UserID, h.wsConnectPerUserMinute); !ok {
+	if ok, _, _ := h.svcCtx.RateLimiter.AllowWSConnectUser(ctx, ticket.UserID, h.wsConnectPerUserMinute); !ok {
 		c.JSON(http.StatusTooManyRequests, gin.H{"error": "连接过于频繁"})
 		return
 	}
@@ -184,30 +162,23 @@ func (h *Handler) Upgrade(c *gin.Context) {
 			"user_id", conn.UserID(),
 			"reason", reason,
 		)
-		if h.reg != nil {
-			h.reg.Counter(metrics.NameCloseReason, "连接关闭原因",
-				map[string]string{"reason": reason}).Inc()
-		}
+		metrics.CloseReason.WithLabelValues(reason).Inc()
 	}
 
 	// 4. 注册连接（进程内 + Redis Presence）
-	if err := h.manager.Register(ctx, conn); err != nil {
+	if err := h.svcCtx.ConnManager.Register(ctx, conn); err != nil {
 		conn.Close("register failed")
 		return
 	}
-	if h.reg != nil {
-		h.reg.Gauge(metrics.NameWSConnectionActive, "在线连接数", nil).Set(h.manager.Count())
-	}
+	metrics.WSConnectionActive.Set(float64(h.svcCtx.ConnManager.Count()))
 
 	// 5. 建立独立 connCtx（不继承 HTTP 请求 ctx，GOCHAT_API.md §11.3.2）
 	connCtx, cancelConn := context.WithCancel(h.appCtx)
 	defer func() {
 		cancelConn()
-		h.manager.Unregister(context.Background(), conn)
+		h.svcCtx.ConnManager.Unregister(context.Background(), conn)
 		conn.Close("closed")
-		if h.reg != nil {
-			h.reg.Gauge(metrics.NameWSConnectionActive, "在线连接数", nil).Set(h.manager.Count())
-		}
+		metrics.WSConnectionActive.Set(float64(h.svcCtx.ConnManager.Count()))
 	}()
 
 	// 6. 通知连接就绪
@@ -242,5 +213,3 @@ func getRequestID(c *gin.Context) string {
 	}
 	return ""
 }
-
-var _ = json.Marshal

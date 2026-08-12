@@ -7,30 +7,22 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log/slog"
 	"time"
 
 	"github.com/Lysia-0113/GO-CHAT/internal/errs"
-	"github.com/Lysia-0113/GO-CHAT/internal/infrastructure/idgen"
 	kafkainfra "github.com/Lysia-0113/GO-CHAT/internal/infrastructure/kafka"
 	"github.com/Lysia-0113/GO-CHAT/internal/message"
 	"github.com/Lysia-0113/GO-CHAT/internal/metrics"
+	"github.com/Lysia-0113/GO-CHAT/internal/svc"
 )
 
-// Worker 持久化 Worker。
+// Worker 持久化 Worker。依赖经 svcCtx 服务定位器取用（GOCHAT_API.md §11.3）。
 type Worker struct {
-	consumer   *kafkainfra.Consumer
-	messages   message.MessageRepository
-	messageIDs idgen.IDGenerator
-	publisher  message.MessagePublisher
-	producer   *kafkainfra.Producer // DLQ 发布
-	topics     kafkainfra.Topics
-
+	svcCtx     *svc.ServiceContext
+	publisher  message.MessagePublisher // 本 Worker 专用的 persisted 发布器
 	maxRetries int
 	backoff    time.Duration
 	txTimeout  time.Duration
-	reg        *metrics.Registry
-	log        *slog.Logger
 }
 
 // Config 是 Worker 配置。
@@ -41,28 +33,13 @@ type Config struct {
 }
 
 // New 创建持久化 Worker。
-func New(consumer *kafkainfra.Consumer,
-	messages message.MessageRepository,
-	messageIDs idgen.IDGenerator,
-	publisher message.MessagePublisher,
-	producer *kafkainfra.Producer,
-	topics kafkainfra.Topics,
-	cfg Config,
-	reg *metrics.Registry,
-	log *slog.Logger,
-) *Worker {
+func New(svcCtx *svc.ServiceContext, cfg Config) *Worker {
 	return &Worker{
-		consumer:   consumer,
-		messages:   messages,
-		messageIDs: messageIDs,
-		publisher:  publisher,
-		producer:   producer,
-		topics:     topics,
+		svcCtx:     svcCtx,
+		publisher:  kafkainfra.NewPublisher(svcCtx.Kafka, "persist-worker"),
 		maxRetries: cfg.MaxRetries,
 		backoff:    cfg.Backoff,
 		txTimeout:  cfg.TxTimeout,
-		reg:        reg,
-		log:        log,
 	}
 }
 
@@ -70,12 +47,12 @@ func New(consumer *kafkainfra.Consumer,
 // 返回 nil 表示优雅退出。
 func (w *Worker) Run(appCtx context.Context) error {
 	for {
-		msg, err := w.consumer.FetchMessage(appCtx)
+		msg, err := w.svcCtx.PersistConsumer.FetchMessage(appCtx)
 		if err != nil {
 			if appCtx.Err() != nil {
 				return nil // 优雅退出
 			}
-			w.log.Error("persist fetch failed", "error", err.Error())
+			w.svcCtx.Log.Error("persist fetch failed", "error", err.Error())
 			select {
 			case <-appCtx.Done():
 				return nil
@@ -87,7 +64,7 @@ func (w *Worker) Run(appCtx context.Context) error {
 		handled, hErr := w.handle(appCtx, msg)
 		if hErr != nil {
 			// 处理失败：不提交 Offset（Kafka 会重新投递，数据库幂等去重）
-			w.log.Error("persist handle failed",
+			w.svcCtx.Log.Error("persist handle failed",
 				"topic", msg.Topic, "partition", msg.Partition, "offset", msg.Offset,
 				"error", hErr.Error(),
 				"committed", handled,
@@ -119,7 +96,7 @@ func (w *Worker) handle(appCtx context.Context, msg kafkainfra.Message) (bool, e
 	}
 
 	// 2. 幂等检查：已存在则复用原结果并重新发布 persisted（GOCHAT_DATABASE.md §10）
-	existing, err := w.messages.FindByClientMessageID(appCtx, ingress.SenderID, ingress.ClientMessageID)
+	existing, err := w.svcCtx.MsgRepo.FindByClientMessageID(appCtx, ingress.SenderID, ingress.ClientMessageID)
 	if err != nil {
 		return false, err
 	}
@@ -127,17 +104,15 @@ func (w *Worker) handle(appCtx context.Context, msg kafkainfra.Message) (bool, e
 		if err := w.publisher.PublishPersisted(appCtx, toPersistedEvent(existing)); err != nil {
 			return false, err
 		}
-		if w.reg != nil {
-			w.reg.Counter(metrics.NamePersistIdempotent, "重复消费命中", nil).Inc()
-		}
-		if err := w.consumer.CommitMessages(appCtx, msg); err != nil {
+		metrics.PersistIdempotent.Inc()
+		if err := w.svcCtx.PersistConsumer.CommitMessages(appCtx, msg); err != nil {
 			return false, err
 		}
 		return true, nil
 	}
 
 	// 3. 分配 message_id（Kafka 消费者内生成，避免入口重复发号）
-	messageID, err := w.messageIDs.Next(appCtx)
+	messageID, err := w.svcCtx.MessageIDs.Next(appCtx)
 	if err != nil {
 		return false, err
 	}
@@ -158,10 +133,8 @@ func (w *Worker) handle(appCtx context.Context, msg kafkainfra.Message) (bool, e
 	var lastErr error
 	for attempt := 0; attempt <= w.maxRetries; attempt++ {
 		if attempt > 0 {
-			w.log.Warn("persist retry", "attempt", attempt, "client_msg_id", ingress.ClientMessageID)
-			if w.reg != nil {
-				w.reg.Counter(metrics.NamePersistRetry, "持久化重试次数", nil).Inc()
-			}
+			w.svcCtx.Log.Warn("persist retry", "attempt", attempt, "client_msg_id", ingress.ClientMessageID)
+			metrics.PersistRetry.Inc()
 			select {
 			case <-appCtx.Done():
 				return false, appCtx.Err()
@@ -170,19 +143,17 @@ func (w *Worker) handle(appCtx context.Context, msg kafkainfra.Message) (bool, e
 		}
 
 		persistCtx, cancel := context.WithTimeout(appCtx, w.txTimeout)
-		persisted, perr := w.messages.Persist(persistCtx, message.PersistInput{Message: msgDomain})
+		persisted, perr := w.svcCtx.MsgRepo.Persist(persistCtx, message.PersistInput{Message: msgDomain})
 		cancel()
 
 		if perr == nil {
 			// 5. MySQL 提交成功后才提交 Offset（GOCHAT_KAFKA.md §7.3）
-			if w.reg != nil {
-				w.reg.Counter(metrics.NamePersistSuccess, "持久化成功数", nil).Inc()
-			}
-			if err := w.consumer.CommitMessages(appCtx, msg); err != nil {
+			metrics.PersistSuccess.Inc()
+			if err := w.svcCtx.PersistConsumer.CommitMessages(appCtx, msg); err != nil {
 				// Offset 提交失败：允许重复消费，唯一索引去重
 				return false, err
 			}
-			w.log.Info("message persisted",
+			w.svcCtx.Log.Info("message persisted",
 				"message_id", persisted.MessageID,
 				"seq", persisted.Seq,
 				"conversation_id", persisted.ConversationID,
@@ -224,13 +195,11 @@ func (w *Worker) dlqAndCommit(ctx context.Context, msg kafkainfra.Message, env k
 	if err != nil {
 		return false, err
 	}
-	if err := w.producer.PublishDLQ(ctx, dlqEnv); err != nil {
-		w.log.Error("dlq publish failed", "error", err.Error())
+	if err := w.svcCtx.Kafka.PublishDLQ(ctx, dlqEnv); err != nil {
+		w.svcCtx.Log.Error("dlq publish failed", "error", err.Error())
 	}
-	if w.reg != nil {
-		w.reg.Counter(metrics.NameKafkaDLQ, "进入死信的事件数", map[string]string{"topic": msg.Topic}).Inc()
-	}
-	if err := w.consumer.CommitMessages(ctx, msg); err != nil {
+	metrics.KafkaDLQ.WithLabelValues(msg.Topic).Inc()
+	if err := w.svcCtx.PersistConsumer.CommitMessages(ctx, msg); err != nil {
 		return false, err
 	}
 	return true, nil

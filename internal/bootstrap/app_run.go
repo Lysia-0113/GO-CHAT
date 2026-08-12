@@ -11,118 +11,75 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	goredis "github.com/redis/go-redis/v9"
+	"github.com/prometheus/client_golang/prometheus"
 	kafkago "github.com/segmentio/kafka-go"
-	"gorm.io/gorm"
 
-	"github.com/Lysia-0113/GO-CHAT/internal/auth"
 	"github.com/Lysia-0113/GO-CHAT/internal/connection"
-	"github.com/Lysia-0113/GO-CHAT/internal/conversation"
 	"github.com/Lysia-0113/GO-CHAT/internal/infrastructure/idgen/segment"
-	kafkainfra "github.com/Lysia-0113/GO-CHAT/internal/infrastructure/kafka"
-	mysqlrepo "github.com/Lysia-0113/GO-CHAT/internal/infrastructure/mysql/repository"
-	redisinfra "github.com/Lysia-0113/GO-CHAT/internal/infrastructure/redis"
-	"github.com/Lysia-0113/GO-CHAT/internal/message"
 	"github.com/Lysia-0113/GO-CHAT/internal/metrics"
-	"github.com/Lysia-0113/GO-CHAT/internal/resilience"
+	"github.com/Lysia-0113/GO-CHAT/internal/svc"
 	httptransport "github.com/Lysia-0113/GO-CHAT/internal/transport/http"
-	"github.com/Lysia-0113/GO-CHAT/internal/transport/http/handler"
 	"github.com/Lysia-0113/GO-CHAT/internal/transport/websocket"
-	"github.com/Lysia-0113/GO-CHAT/internal/user"
 	"github.com/Lysia-0113/GO-CHAT/internal/worker/deliver"
 	"github.com/Lysia-0113/GO-CHAT/internal/worker/outbox"
 	"github.com/Lysia-0113/GO-CHAT/internal/worker/persist"
 )
 
-// App 是装配完成的应用。
+// App 是装配完成的应用：svcCtx 持有全部依赖，reg 仅供 /metrics 输出
+// （GOCHAT_API.md §11.3：ServiceContext 即服务定位器）。
 type App struct {
-	cfg    *Config
-	log    *slog.Logger
-	reg    *metrics.Registry
-	svcCtx *ServiceContext
-
-	db    *gorm.DB
-	redis *goredis.Client
-	kafka *kafkainfra.Producer
-
-	presence *redisinfra.PresenceRegistry
-	pubsub   *redisinfra.PubsubGateway
-
-	persistConsumer *kafkainfra.Consumer
-	deliverConsumer *kafkainfra.Consumer
-	outboxRepo      *mysqlrepo.OutboxRepository
-	topics          kafkainfra.Topics
-
-	userRepo        *mysqlrepo.UserRepository
-	convRepo        *mysqlrepo.ConversationRepository
-	msgRepo         *mysqlrepo.MessageRepository
-	msgIDs          *segment.Generator
-	userIDs         *segment.Generator
-	convIDs         *segment.Generator
-	users           *user.Service
-	convos          *conversation.Service
-	messages        *message.Service
-	connManager     *connection.Manager
-	wsTickets       *redisinfra.WSTicketStore
-	recentCache     *redisinfra.RecentMessageCache
-	rateLimiter     *redisinfra.RateLimiter
-	idemStore       *redisinfra.IdempotencyStore
-	breakers        *resilience.Breakers
-	tokens          *auth.TokenManager
-	historyBulkhead *resilience.Bulkhead
-	ingressBulkhead *resilience.Bulkhead
+	svcCtx *svc.ServiceContext
+	reg    *prometheus.Registry
 }
 
 // Run 启动 HTTP 服务与全部 Worker，阻塞直到 ctx 取消后优雅退出。
 func (a *App) Run(appCtx context.Context) error {
 	// ---- Worker 启动 ----
-	persistWorker := persist.New(a.persistConsumer, a.msgRepo, a.msgIDs,
-		kafkainfra.NewPublisher(a.kafka, "persist-worker"), a.kafka, a.topics,
-		persist.Config{
-			MaxRetries: a.cfg.Kafka.PersistMaxRetries,
-			Backoff:    a.cfg.Kafka.PersistBackoff,
-			TxTimeout:  a.cfg.Resilience.PersistTxTimeout,
-		}, a.reg, a.log)
-	outboxPublisher := outbox.New(a.outboxRepo, a.kafka, a.topics, outbox.Config{
-		MaxRetries:   a.cfg.Kafka.OutboxMaxRetries,
-		Backoff:      a.cfg.Kafka.OutboxBackoff,
-		PollInterval: a.cfg.Kafka.OutboxPollInterval,
-		BatchSize:    a.cfg.Kafka.OutboxBatchSize,
-		InstanceID:   a.cfg.Server.NodeID,
-	}, a.reg, a.log)
-	deliverWorker := deliver.New(a.deliverConsumer, a.convRepo, a.recentCache, a.presence, a.connManager, a.pubsub, a.reg, a.log)
+	persistWorker := persist.New(a.svcCtx, persist.Config{
+		MaxRetries: a.svcCtx.Config.Kafka.PersistMaxRetries,
+		Backoff:    a.svcCtx.Config.Kafka.PersistBackoff,
+		TxTimeout:  a.svcCtx.Config.Resilience.PersistTxTimeout,
+	})
+	outboxPublisher := outbox.New(a.svcCtx, outbox.Config{
+		MaxRetries:   a.svcCtx.Config.Kafka.OutboxMaxRetries,
+		Backoff:      a.svcCtx.Config.Kafka.OutboxBackoff,
+		PollInterval: a.svcCtx.Config.Kafka.OutboxPollInterval,
+		BatchSize:    a.svcCtx.Config.Kafka.OutboxBatchSize,
+		InstanceID:   a.svcCtx.Config.Server.NodeID,
+	})
+	deliverWorker := deliver.New(a.svcCtx)
 
 	// 多实例取同一个 Consumer Group 时，每个实例各启动一份 Worker
-	for i := 0; i < a.cfg.Resilience.PersistWorkers; i++ {
+	for i := 0; i < a.svcCtx.Config.Resilience.PersistWorkers; i++ {
 		go func() {
 			if err := persistWorker.Run(appCtx); err != nil {
-				a.log.Error("persist worker exited", "error", err.Error())
+				a.svcCtx.Log.Error("persist worker exited", "error", err.Error())
 			}
 		}()
 	}
-	for i := 0; i < a.cfg.Resilience.DeliveryWorkers; i++ {
+	for i := 0; i < a.svcCtx.Config.Resilience.DeliveryWorkers; i++ {
 		go func() {
 			if err := deliverWorker.Run(appCtx); err != nil {
-				a.log.Error("deliver worker exited", "error", err.Error())
+				a.svcCtx.Log.Error("deliver worker exited", "error", err.Error())
 			}
 		}()
 	}
-	for i := 0; i < a.cfg.Resilience.OutboxWorkers; i++ {
+	for i := 0; i < a.svcCtx.Config.Resilience.OutboxWorkers; i++ {
 		go func() {
 			if err := outboxPublisher.Run(appCtx); err != nil {
-				a.log.Error("outbox publisher exited", "error", err.Error())
+				a.svcCtx.Log.Error("outbox publisher exited", "error", err.Error())
 			}
 		}()
 	}
 
 	// ---- 跨节点 Pub/Sub 投递订阅（本节点网关） ----
-	if a.pubsub != nil {
-		deliveryCh, err := a.pubsub.Subscribe(appCtx)
+	if a.svcCtx.Pubsub != nil {
+		deliveryCh, err := a.svcCtx.Pubsub.Subscribe(appCtx)
 		if err == nil {
 			go func() {
 				for ev := range deliveryCh {
 					for _, connID := range ev.ConnectionIDs {
-						_ = a.connManager.PushToConnection(appCtx, connID, connection.Event{
+						_ = a.svcCtx.ConnManager.PushToConnection(appCtx, connID, connection.Event{
 							Event: ev.EventName,
 							Data:  ev.Data,
 						})
@@ -130,7 +87,7 @@ func (a *App) Run(appCtx context.Context) error {
 				}
 			}()
 		} else {
-			a.log.Warn("pubsub subscribe failed", "error", err.Error())
+			a.svcCtx.Log.Warn("pubsub subscribe failed", "error", err.Error())
 		}
 	}
 
@@ -138,41 +95,30 @@ func (a *App) Run(appCtx context.Context) error {
 	go a.metricsLoop(appCtx)
 
 	// ---- HTTP / WebSocket ----
-	wsHandler := websocket.NewHandler(appCtx, a.wsTickets, a.rateLimiter, a.connManager, a.presence,
-		a.messages, a.convos,
-		websocket.HandlerConfig{
-			ReadLimit:              a.cfg.Server.WSReadLimit,
-			HeartbeatInterval:      a.cfg.Server.WSHeartbeatInterval,
-			MissedHeartbeat:        a.cfg.Server.WSMissedHeartbeat,
-			WriteQueueSize:         a.cfg.Server.WSWriteQueueSize,
-			WriteQueueTimeout:      a.cfg.Server.WSWriteQueueTimeout,
-			InboundRatePerSec:      a.cfg.Resilience.ConnInboundPerSecond,
-			InboundRateBurst:       a.cfg.Resilience.ConnInboundBurst,
-			WSConnectPerMinute:     a.cfg.Resilience.WSConnectPerMinute,
-			WSConnectPerUserMinute: a.cfg.Resilience.WSConnectPerUserPerMinute,
-		}, a.reg, a.log)
+	wsHandler := websocket.NewHandler(appCtx, a.svcCtx, websocket.HandlerConfig{
+		ReadLimit:              a.svcCtx.Config.Server.WSReadLimit,
+		HeartbeatInterval:      a.svcCtx.Config.Server.WSHeartbeatInterval,
+		MissedHeartbeat:        a.svcCtx.Config.Server.WSMissedHeartbeat,
+		WriteQueueSize:         a.svcCtx.Config.Server.WSWriteQueueSize,
+		WriteQueueTimeout:      a.svcCtx.Config.Server.WSWriteQueueTimeout,
+		InboundRatePerSec:      a.svcCtx.Config.Resilience.ConnInboundPerSecond,
+		InboundRateBurst:       a.svcCtx.Config.Resilience.ConnInboundBurst,
+		WSConnectPerMinute:     a.svcCtx.Config.Resilience.WSConnectPerMinute,
+		WSConnectPerUserMinute: a.svcCtx.Config.Resilience.WSConnectPerUserPerMinute,
+	}, a.svcCtx.Log)
 
-	router := httptransport.New(httptransport.Router{
-		Tokens:              a.tokens,
-		AuthHandler:         handler.NewAuthHandler(a.users, a.tokens, a.rateLimiter),
-		UserHandler:         handler.NewUserHandler(a.users),
-		ConversationHandler: handler.NewConversationHandler(a.convos),
-		MessageHandler:      handler.NewMessageHandler(a.messages, a.rateLimiter, a.historyBulkhead),
-		HealthHandler:       handler.NewHealthHandler(a.db, a.redis, a.kafkaReady),
-		WSHandler:           wsHandler,
-		MetricsHandler:      a.metricsHandler(),
-	})
+	router := httptransport.New(a.svcCtx, wsHandler, a.metricsHandler(), a.kafkaReady)
 
 	gin.SetMode(gin.ReleaseMode)
 	srv := &http.Server{
-		Addr:              a.cfg.Server.Addr,
+		Addr:              a.svcCtx.Config.Server.Addr,
 		Handler:           router,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	errCh := make(chan error, 1)
 	go func() {
-		a.log.Info("server started", "addr", a.cfg.Server.Addr, "node_id", a.cfg.Server.NodeID)
+		a.svcCtx.Log.Info("server started", "addr", a.svcCtx.Config.Server.Addr, "node_id", a.svcCtx.Config.Server.NodeID)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
@@ -180,32 +126,32 @@ func (a *App) Run(appCtx context.Context) error {
 
 	select {
 	case <-appCtx.Done():
-		a.log.Info("shutting down")
+		a.svcCtx.Log.Info("shutting down")
 	case err := <-errCh:
 		return err
 	}
 
 	// ---- 优雅退出 ----
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), a.cfg.Server.ShutdownTimeout)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), a.svcCtx.Config.Server.ShutdownTimeout)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		a.log.Warn("http shutdown", "error", err.Error())
+		a.svcCtx.Log.Warn("http shutdown", "error", err.Error())
 	}
-	a.persistConsumer.Close()
-	a.deliverConsumer.Close()
-	a.kafka.Close()
-	if sqlDB, err := a.db.DB(); err == nil {
+	a.svcCtx.PersistConsumer.Close()
+	a.svcCtx.DeliverConsumer.Close()
+	a.svcCtx.Kafka.Close()
+	if sqlDB, err := a.svcCtx.DB.DB(); err == nil {
 		_ = sqlDB.Close()
 	}
-	_ = a.redis.Close()
-	a.log.Info("server stopped")
+	_ = a.svcCtx.Redis.Close()
+	a.svcCtx.Log.Info("server stopped")
 	return nil
 }
 
 // kafkaReady 就绪探针：能读取 Topic 元数据即视为可用。
 func (a *App) kafkaReady(ctx context.Context) error {
 	client := &kafkago.Client{
-		Addr:    kafkago.TCP(a.cfg.Kafka.Brokers...),
+		Addr:    kafkago.TCP(a.svcCtx.Config.Kafka.Brokers...),
 		Timeout: 2 * time.Second,
 	}
 	_, err := client.Metadata(ctx, &kafkago.MetadataRequest{})
@@ -224,34 +170,30 @@ func (a *App) metricsLoop(ctx context.Context) {
 		case <-ticker.C:
 			// 号段剩余库存（GOCHAT_RESILIENCE.md §11.1）
 			for name, gen := range map[string]*segment.Generator{
-				"im_user": a.userIDs, "im_conversation": a.convIDs, "im_message": a.msgIDs,
+				"im_user": a.svcCtx.UserIDs, "im_conversation": a.svcCtx.ConvIDs, "im_message": a.svcCtx.MessageIDs,
 			} {
 				st := gen.State()
-				a.reg.Gauge(metrics.NameIDSegmentRemaining, "号段剩余库存",
-					map[string]string{"biz_tag": name, "node": a.cfg.Server.NodeID}).Set(st.Remaining)
+				metrics.IDSegmentRemaining.WithLabelValues(name, a.svcCtx.Config.Server.NodeID).Set(float64(st.Remaining))
 			}
 			// 熔断器状态
-			for name, st := range a.breakers.States() {
-				a.reg.Gauge(metrics.NameBreakerState, "熔断器状态 0=closed 1=open 2=half-open",
-					map[string]string{"dependency": name}).Set(int64(st))
+			for name, st := range a.svcCtx.Breakers.States() {
+				metrics.BreakerState.WithLabelValues(name).Set(float64(st))
 			}
 			// 连接数
-			a.reg.Gauge(metrics.NameWSConnectionActive, "在线连接数", nil).Set(a.connManager.Count())
+			metrics.WSConnectionActive.Set(float64(a.svcCtx.ConnManager.Count()))
 			// 隔离舱占用
-			a.reg.Gauge(metrics.NameBulkheadQueueLength, "隔离舱占用", map[string]string{"worker": "history_query"}).Set(a.historyBulkhead.Active())
-			a.reg.Gauge(metrics.NameBulkheadQueueLength, "隔离舱占用", map[string]string{"worker": "ws_ingress"}).Set(a.ingressBulkhead.Active())
+			metrics.BulkheadQueueLength.WithLabelValues("history_query").Set(float64(a.svcCtx.HistoryBulkhead.Active()))
+			metrics.BulkheadQueueLength.WithLabelValues("ws_ingress").Set(float64(a.svcCtx.IngressBulkhead.Active()))
 		}
 	}
 }
 
-// metricsHandler 输出 Prometheus 文本格式指标。
+// metricsHandler 输出 Prometheus 文本格式指标（promhttp 标准处理器）。
 func (a *App) metricsHandler() gin.HandlerFunc {
-	if !a.cfg.Metrics.Enabled {
+	if !a.svcCtx.Config.Metrics.Enabled {
 		return nil
 	}
-	return func(c *gin.Context) {
-		c.Data(http.StatusOK, "text/plain; version=0.0.4", []byte(a.reg.Render()))
-	}
+	return gin.WrapH(metrics.Handler(a.reg))
 }
 
 // ---- 日志辅助 ----
