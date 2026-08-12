@@ -156,6 +156,21 @@ var OutboxOldestAge = prometheus.NewGaugeVec(
 	[]string{"event_type"},
 )
 
+// ---- 直方图（延迟分布，用于校准超时）----
+
+// DependencyDuration 依赖调用耗时（GOCHAT_RESILIENCE.md §4.2 超时校准）。
+// operation 取值：redis_recent_read / mysql_history_query / kafka:ingress_publish
+// / kafka:persisted_publish / kafka:dlq_publish。
+// 桶位覆盖超时表：Redis 50ms、MySQL 200ms、Kafka 300ms 均在桶内。
+var DependencyDuration = prometheus.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Name:    "dependency_duration_seconds",
+		Help:    "依赖调用耗时",
+		Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1},
+	},
+	[]string{"operation"},
+)
+
 // New 创建注册表并注册全部指标（启动时调用一次）。
 func New() *prometheus.Registry {
 	reg := prometheus.NewRegistry()
@@ -167,7 +182,7 @@ func New() *prometheus.Registry {
 		PersistSuccess, PersistRetry, PersistIdempotent, KafkaDLQ,
 		RecentCacheFallback, OnlineQueryFailed, PushToConnFailed, OutboxPublishError,
 		WSConnectionActive, IDSegmentRemaining, BreakerState, BulkheadQueueLength,
-		OutboxPending, OutboxOldestAge,
+		OutboxPending, OutboxOldestAge, DependencyDuration,
 	)
 	return reg
 }

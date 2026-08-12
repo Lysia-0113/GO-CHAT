@@ -102,6 +102,10 @@ func (p *Producer) PublishDLQ(ctx context.Context, env Envelope) error {
 }
 
 func (p *Producer) publish(ctx context.Context, topic string, env Envelope) error {
+	start := time.Now()
+	defer func() {
+		metrics.DependencyDuration.WithLabelValues(p.breakerName(topic)).Observe(time.Since(start).Seconds())
+	}()
 	convID := parseID(env.ConversationID)
 	// 熔断保护：按 依赖:操作 维度（GOCHAT_RESILIENCE.md §7.3）
 	breakerName := p.breakerName(topic)

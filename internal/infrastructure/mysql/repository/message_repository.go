@@ -11,6 +11,7 @@ import (
 	"github.com/Lysia-0113/GO-CHAT/internal/errs"
 	"github.com/Lysia-0113/GO-CHAT/internal/infrastructure/mysql/model"
 	"github.com/Lysia-0113/GO-CHAT/internal/message"
+	"github.com/Lysia-0113/GO-CHAT/internal/metrics"
 )
 
 // MessageRepository 实现 message.MessageRepository。
@@ -53,6 +54,10 @@ func (r *MessageRepository) FindByClientMessageID(ctx context.Context, senderID 
 }
 
 func (r *MessageRepository) ListBefore(ctx context.Context, conversationID, beforeSeq int64, limit int) ([]message.Message, error) {
+	start := time.Now()
+	defer func() {
+		metrics.DependencyDuration.WithLabelValues("mysql_history_query").Observe(time.Since(start).Seconds())
+	}()
 	q := r.db.WithContext(ctx).Where("conversation_id = ?", conversationID)
 	if beforeSeq > 0 {
 		q = q.Where("seq < ?", beforeSeq)
@@ -66,6 +71,10 @@ func (r *MessageRepository) ListBefore(ctx context.Context, conversationID, befo
 }
 
 func (r *MessageRepository) ListAfter(ctx context.Context, conversationID, afterSeq int64, limit int) ([]message.Message, error) {
+	start := time.Now()
+	defer func() {
+		metrics.DependencyDuration.WithLabelValues("mysql_history_query").Observe(time.Since(start).Seconds())
+	}()
 	var rows []model.Message
 	err := r.db.WithContext(ctx).
 		Where("conversation_id = ? AND seq > ?", conversationID, afterSeq).
@@ -90,6 +99,10 @@ func (r *MessageRepository) ListAfter(ctx context.Context, conversationID, after
 // 任一错误整体回滚，不允许留下"已递增但无消息"的 last_seq。
 // 事务内唯一索引冲突同样回滚后复用已存在消息。
 func (r *MessageRepository) Persist(ctx context.Context, input message.PersistInput) (*message.Message, error) {
+	start := time.Now()
+	defer func() {
+		metrics.DependencyDuration.WithLabelValues("mysql_persist_tx").Observe(time.Since(start).Seconds())
+	}()
 	m := input.Message
 	rawID, err := uuidToBytes(m.ClientMessageID)
 	if err != nil {

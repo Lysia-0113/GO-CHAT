@@ -10,6 +10,7 @@ import (
 
 	"github.com/Lysia-0113/GO-CHAT/internal/errs"
 	"github.com/Lysia-0113/GO-CHAT/internal/message"
+	"github.com/Lysia-0113/GO-CHAT/internal/metrics"
 )
 
 // maxExactSeq 是 ZSET double score 可精确表示的上界（2^53，GOCHAT_REDIS.md §4.2）。
@@ -83,6 +84,10 @@ func (c *RecentMessageCache) Append(ctx context.Context, m *message.Message) err
 // ListBefore 向前翻页读取缓存；complete=false 时调用方回源 MySQL
 // （GOCHAT_REDIS.md §4.4：缺失、窗口不足、序号不连续均回退）。
 func (c *RecentMessageCache) ListBefore(ctx context.Context, conversationID, visibleAfterSeq, beforeSeq int64, limit int) ([]message.Message, bool, error) {
+	start := time.Now()
+	defer func() {
+		metrics.DependencyDuration.WithLabelValues("redis_recent_read").Observe(time.Since(start).Seconds())
+	}()
 	ctx, cancel := withTimeout(ctx, c.opts.ReadTimeout)
 	defer cancel()
 
@@ -113,6 +118,10 @@ func (c *RecentMessageCache) ListBefore(ctx context.Context, conversationID, vis
 
 // ListAfter 离线补偿读取（ascending）。
 func (c *RecentMessageCache) ListAfter(ctx context.Context, conversationID, visibleAfterSeq, afterSeq int64, limit int) ([]message.Message, bool, error) {
+	start := time.Now()
+	defer func() {
+		metrics.DependencyDuration.WithLabelValues("redis_recent_read").Observe(time.Since(start).Seconds())
+	}()
 	ctx, cancel := withTimeout(ctx, c.opts.ReadTimeout)
 	defer cancel()
 
