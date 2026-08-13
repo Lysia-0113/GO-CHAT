@@ -13,11 +13,11 @@ var luaFS embed.FS
 
 // Scripts 集中加载 Lua 脚本（GOCHAT_REDIS.md §2.1）。
 type Scripts struct {
-	AppendRecentMessage *goredis.Script
-	ConsumeWSTicket     *goredis.Script
-	AcquireMessageIdem  *goredis.Script
-	ReleaseMessageIdem  *goredis.Script
-	TokenBucket         *goredis.Script
+	ConsumeWSTicket    *goredis.Script
+	AcquireMessageIdem *goredis.Script
+	ReleaseMessageIdem *goredis.Script
+	TokenBucket        *goredis.Script
+	AdvanceCursor      *goredis.Script
 }
 
 // LoadScripts 从嵌入文件加载全部脚本；加载失败返回错误。
@@ -31,9 +31,6 @@ func LoadScripts() (*Scripts, error) {
 	}
 	s := &Scripts{}
 	var err error
-	if s.AppendRecentMessage, err = load("append_recent_message.lua"); err != nil {
-		return nil, err
-	}
 	if s.ConsumeWSTicket, err = load("consume_ws_ticket.lua"); err != nil {
 		return nil, err
 	}
@@ -44,6 +41,9 @@ func LoadScripts() (*Scripts, error) {
 		return nil, err
 	}
 	if s.TokenBucket, err = load("token_bucket.lua"); err != nil {
+		return nil, err
+	}
+	if s.AdvanceCursor, err = load("advance_cursor.lua"); err != nil {
 		return nil, err
 	}
 	return s, nil

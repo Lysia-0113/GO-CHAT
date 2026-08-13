@@ -50,6 +50,10 @@ type MessagePage struct {
 	NextBeforeSeq int64
 	NextAfterSeq  int64
 	HasMore       bool
+	// ResyncRequired 为 true 时，客户端本地游标低于可见性下界
+	// （刚入群/清空聊天记录），应清空本地副本全量重拉。
+	// 响应内容仍从可见区开始返回，老客户端忽略该字段行为不变。
+	ResyncRequired bool
 }
 
 // AckReceivedCommand 是批量到达确认（message.received_ack）。

@@ -2,7 +2,6 @@ package redis
 
 import (
 	"context"
-	"encoding/json"
 	"testing"
 	"time"
 
@@ -65,74 +64,6 @@ func TestWSTicketOneTime(t *testing.T) {
 	}
 	if bad != nil {
 		t.Fatal("invalid ticket must be rejected")
-	}
-}
-
-// TestRecentCacheAppendAndRead 最近消息缓存：追加、读取、裁剪（GOCHAT_REDIS.md §4.3）。
-func TestRecentCacheAppendAndRead(t *testing.T) {
-	client, scripts := newTestRedis(t)
-	cache := NewRecentMessageCache(client, scripts, 24*time.Hour, 3, testOpts())
-
-	for seq := int64(1); seq <= 5; seq++ {
-		if err := cache.Append(context.Background(), &message.Message{
-			MessageID: 1000 + seq, Seq: seq, ConversationID: 9001, SenderID: 1,
-			MessageType: 1, Content: json.RawMessage(`{"text":"hi"}`),
-		}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// max=3：应只保留 seq 3,4,5
-	items, complete, err := cache.ListBefore(context.Background(), 9001, 0, 100, 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !complete || len(items) != 3 {
-		t.Fatalf("expected 3 items complete, got %d complete=%v", len(items), complete)
-	}
-	if items[0].Seq != 5 || items[2].Seq != 3 {
-		t.Fatalf("unexpected order: %+v", items)
-	}
-}
-
-// TestRecentCacheMissingFieldFallsBack 快照缺失时 complete=false（回源 MySQL）。
-func TestRecentCacheMissingFieldFallsBack(t *testing.T) {
-	client, scripts := newTestRedis(t)
-	cache := NewRecentMessageCache(client, scripts, 24*time.Hour, 10, testOpts())
-
-	if err := cache.Append(context.Background(), &message.Message{
-		MessageID: 1, Seq: 1, ConversationID: 9001, SenderID: 1, MessageType: 1,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	// 手工删除 data HASH 字段模拟不一致
-	if err := client.HDel(context.Background(), RecentDataKey(9001), "1").Err(); err != nil {
-		t.Fatal(err)
-	}
-	_, complete, err := cache.ListBefore(context.Background(), 9001, 0, 100, 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if complete {
-		t.Fatal("expected incomplete when snapshot missing")
-	}
-}
-
-// TestRecentCacheVisibleBound 可见性下界过滤。
-func TestRecentCacheVisibleBound(t *testing.T) {
-	client, scripts := newTestRedis(t)
-	cache := NewRecentMessageCache(client, scripts, 24*time.Hour, 10, testOpts())
-	for seq := int64(1); seq <= 5; seq++ {
-		_ = cache.Append(context.Background(), &message.Message{
-			MessageID: seq, Seq: seq, ConversationID: 9001, SenderID: 1, MessageType: 1,
-		})
-	}
-	// visibleAfterSeq=3 → 只返回 seq 4,5
-	items, complete, err := cache.ListBefore(context.Background(), 9001, 3, 100, 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !complete || len(items) != 2 || items[0].Seq != 5 {
-		t.Fatalf("unexpected: %+v complete=%v", items, complete)
 	}
 }
 
@@ -277,5 +208,57 @@ func TestPresenceStaleCleanup(t *testing.T) {
 	}
 	if len(routes) != 0 {
 		t.Fatalf("expected empty after cleanup, got %+v", routes)
+	}
+}
+
+// TestCursorStore 同步游标：缺失读取、只增不减、会话内用户互不影响（GOCHAT_REDIS.md §10）。
+func TestCursorStore(t *testing.T) {
+	client, scripts := newTestRedis(t)
+	store := NewCursorStore(client, scripts, testOpts())
+	ctx := context.Background()
+
+	// 不存在：exists=false
+	seq, exists, err := store.Get(ctx, 9001, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exists || seq != 0 {
+		t.Fatalf("expected missing cursor, got seq=%d exists=%v", seq, exists)
+	}
+
+	// 推进到 100
+	got, err := store.Advance(ctx, 9001, 1, 100)
+	if err != nil || got != 100 {
+		t.Fatalf("advance failed: %v %v", got, err)
+	}
+
+	// 回退推进：保持最大值（响应乱序也不能回退）
+	got, err = store.Advance(ctx, 9001, 1, 50)
+	if err != nil || got != 100 {
+		t.Fatalf("cursor must not regress, got %v %v", got, err)
+	}
+
+	// 更大值推进
+	got, err = store.Advance(ctx, 9001, 1, 150)
+	if err != nil || got != 150 {
+		t.Fatalf("advance failed: %v %v", got, err)
+	}
+
+	// 读取
+	seq, exists, err = store.Get(ctx, 9001, 1)
+	if err != nil || !exists || seq != 150 {
+		t.Fatalf("expected 150, got seq=%d exists=%v err=%v", seq, exists, err)
+	}
+
+	// 同一会话内不同用户互不影响
+	_, exists, _ = store.Get(ctx, 9001, 2)
+	if exists {
+		t.Fatal("user 2 should have no cursor")
+	}
+	if _, err := store.Advance(ctx, 9001, 2, 80); err != nil {
+		t.Fatal(err)
+	}
+	if seq, _, _ = store.Get(ctx, 9001, 1); seq != 150 {
+		t.Fatalf("user 1 cursor changed: %d", seq)
 	}
 }

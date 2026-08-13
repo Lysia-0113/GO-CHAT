@@ -28,9 +28,6 @@ auth:
   # 内存参数，不牺牲密码哈希的内存硬度。
   argon2_threads: 2
 
-presence:
-  recent_cache_max: 100
-
 resilience:
   history_query_concurrency: 8
   ws_ingress_concurrency: 8

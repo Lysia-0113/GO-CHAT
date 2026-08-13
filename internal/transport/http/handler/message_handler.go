@@ -75,6 +75,8 @@ func (h *MessageHandler) List(c *gin.Context) {
 		"next_before_seq": page.NextBeforeSeq,
 		"next_after_seq":  page.NextAfterSeq,
 		"has_more":        page.HasMore,
+		// resync_required：客户端本地游标过期，应清空本地副本全量重拉
+		"resync_required": page.ResyncRequired,
 	})
 }
 

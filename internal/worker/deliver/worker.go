@@ -73,25 +73,7 @@ func (w *Worker) handle(ctx context.Context, msg kafka.Message) error {
 	}
 	w.dedup.Mark(event.MessageID)
 
-	// 2. 更新最近消息缓存；失败不回滚 MySQL（GOCHAT_REDIS.md §4.5）
-	if w.svcCtx.RecentCache != nil {
-		if err := w.svcCtx.RecentCache.Append(ctx, &message.Message{
-			MessageID:       event.MessageID,
-			ClientMessageID: event.ClientMessageID,
-			ConversationID:  event.ConversationID,
-			Seq:             event.Seq,
-			SenderID:        event.SenderID,
-			MessageType:     event.MessageType,
-			Content:         event.Content,
-			Status:          message.StatusNormal,
-			CreatedAt:       event.CreatedAt,
-		}); err != nil {
-			w.svcCtx.Log.Warn("recent cache append failed", "message_id", event.MessageID, "error", err.Error())
-			metrics.RecentCacheFallback.Inc()
-		}
-	}
-
-	// 3. 成员 fanout：发送者收 message.persisted，接收者收 message.new
+	// 2. 成员 fanout：发送者收 message.persisted，接收者收 message.new
 	memberIDs, err := w.svcCtx.ConvRepo.ListMemberIDs(ctx, event.ConversationID)
 	if err != nil {
 		return err
@@ -100,7 +82,7 @@ func (w *Worker) handle(ctx context.Context, msg kafka.Message) error {
 		w.pushToMember(ctx, event, memberID)
 	}
 
-	// 4. 提交 Offset
+	// 3. 提交 Offset
 	return w.svcCtx.DeliverConsumer.CommitMessages(ctx, msg)
 }
 

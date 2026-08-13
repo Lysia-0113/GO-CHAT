@@ -69,31 +69,6 @@ func (f *fakeConvState) Get(ctx context.Context, actorID, conversationID int64) 
 	return f.conv, nil
 }
 
-type fakeRecentCache struct {
-	items     []Message
-	complete  bool
-	err       error
-	appendErr error
-}
-
-func (f *fakeRecentCache) ListBefore(ctx context.Context, conversationID, visibleAfterSeq, beforeSeq int64, limit int) ([]Message, bool, error) {
-	if f.err != nil {
-		return nil, false, f.err
-	}
-	return f.items, f.complete, nil
-}
-
-func (f *fakeRecentCache) ListAfter(ctx context.Context, conversationID, visibleAfterSeq, afterSeq int64, limit int) ([]Message, bool, error) {
-	if f.err != nil {
-		return nil, false, f.err
-	}
-	return f.items, f.complete, nil
-}
-
-func (f *fakeRecentCache) Append(ctx context.Context, m *Message) error { return f.appendErr }
-
-func (f *fakeRecentCache) Delete(ctx context.Context, conversationID int64) error { return nil }
-
 type fakeRateLimiter struct {
 	allowSend bool
 }
@@ -118,6 +93,39 @@ type fakeIdem struct {
 
 func newFakeIdem() *fakeIdem {
 	return &fakeIdem{state: make(map[string]IdemResult)}
+}
+
+// fakeSyncCursor 是 SyncCursorStore 的内存实现：只增不减，记录推进历史。
+type fakeSyncCursor struct {
+	mu       sync.Mutex
+	cursors  map[[2]int64]int64
+	advances [][3]int64 // conversationID, userID, seq
+	fail     bool
+}
+
+func newFakeSyncCursor() *fakeSyncCursor {
+	return &fakeSyncCursor{cursors: make(map[[2]int64]int64)}
+}
+
+func (f *fakeSyncCursor) Advance(ctx context.Context, conversationID, userID, seq int64) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fail {
+		return 0, errs.New(errs.RedisUnavailable, "cursor down")
+	}
+	f.advances = append(f.advances, [3]int64{conversationID, userID, seq})
+	key := [2]int64{conversationID, userID}
+	if seq > f.cursors[key] {
+		f.cursors[key] = seq
+	}
+	return f.cursors[key], nil
+}
+
+func (f *fakeSyncCursor) Get(ctx context.Context, conversationID, userID int64) (int64, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	seq, ok := f.cursors[[2]int64{conversationID, userID}]
+	return seq, ok, nil
 }
 
 func (f *fakeIdem) Acquire(ctx context.Context, senderID int64, clientMessageID string) (IdemResult, string, error) {
@@ -203,7 +211,7 @@ func newTestService(overrides map[string]interface{}) *Service {
 		Messages:      &fakeMsgRepo{},
 		Members:       checker,
 		Conversations: &fakeConvState{conv: conv},
-		RecentCache:   &fakeRecentCache{},
+		Cursors:       newFakeSyncCursor(),
 		Publisher:     pub,
 		RateLimiter:   &fakeRateLimiter{allowSend: true},
 		FastIdem:      newFakeIdem(),
@@ -375,32 +383,18 @@ func TestListHistoryBeforeAfterMutuallyExclusive(t *testing.T) {
 	}
 }
 
-func TestListHistoryCacheHitAndFallback(t *testing.T) {
+func TestListHistoryBeforeMySQL(t *testing.T) {
 	s := newTestService(nil)
-	msgs := []Message{{MessageID: 1, Seq: 50, ConversationID: 10}}
-	cache := s.deps.RecentCache.(*fakeRecentCache)
+	repo := s.deps.Messages.(*fakeMsgRepo)
+	repo.msgs = append(repo.msgs, Message{MessageID: 9, Seq: 60, ConversationID: 10, SenderID: 1})
 
-	// 缓存完整命中
-	cache.items = msgs
-	cache.complete = true
+	// 读路径直连 MySQL（已移除缓存层）
 	page, err := s.ListHistory(context.Background(), HistoryQuery{ActorID: 1, ConversationID: 10, BeforeSeq: 100, Limit: 20})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(page.Items) != 1 || page.Items[0].Seq != 50 {
-		t.Fatalf("cache hit failed: %+v", page.Items)
-	}
-
-	// 缓存不完整 → 回源 MySQL
-	cache.complete = false
-	repo := s.deps.Messages.(*fakeMsgRepo)
-	repo.msgs = append(repo.msgs, Message{MessageID: 9, Seq: 60, ConversationID: 10, SenderID: 1})
-	page, err = s.ListHistory(context.Background(), HistoryQuery{ActorID: 1, ConversationID: 10, BeforeSeq: 100, Limit: 20})
-	if err != nil {
-		t.Fatal(err)
-	}
 	if len(page.Items) != 1 || page.Items[0].Seq != 60 {
-		t.Fatalf("mysql fallback failed: %+v", page.Items)
+		t.Fatalf("mysql query failed: %+v", page.Items)
 	}
 }
 
@@ -466,6 +460,96 @@ func TestSendProcessingBackoff(t *testing.T) {
 	_, err := s.Send(context.Background(), cmd)
 	if !errs.IsCode(err, errs.SystemBusy) || !errs.As(err).Retryable {
 		t.Fatalf("expected retryable SYSTEM_BUSY, got %v", err)
+	}
+}
+
+// ---- 同步游标（GOCHAT_REDIS.md §10）----
+
+func TestListHistoryAfterAdvancesServerCursor(t *testing.T) {
+	s := newTestService(nil)
+	repo := s.deps.Messages.(*fakeMsgRepo)
+	repo.msgs = []Message{
+		{MessageID: 1, Seq: 101, ConversationID: 10, SenderID: 1},
+		{MessageID: 2, Seq: 102, ConversationID: 10, SenderID: 1},
+	}
+	cursor := s.deps.Cursors.(*fakeSyncCursor)
+
+	page, err := s.ListHistory(context.Background(), HistoryQuery{ActorID: 1, ConversationID: 10, AfterSeq: 100, Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 2 || page.ResyncRequired {
+		t.Fatalf("unexpected page: %+v", page)
+	}
+	if page.NextAfterSeq != 102 {
+		t.Fatalf("expected next_after_seq 102, got %d", page.NextAfterSeq)
+	}
+	// 服务端游标推进到本次响应覆盖的最大 seq
+	seq, ok, _ := cursor.Get(context.Background(), 10, 1)
+	if !ok || seq != 102 {
+		t.Fatalf("expected server cursor 102, got %d exists=%v", seq, ok)
+	}
+}
+
+func TestListHistoryAfterNoNewMessagesKeepsCursor(t *testing.T) {
+	s := newTestService(nil)
+	cursor := s.deps.Cursors.(*fakeSyncCursor)
+
+	// after_seq 已到最新（无更晚消息）：游标保持在客户端位置
+	page, err := s.ListHistory(context.Background(), HistoryQuery{ActorID: 1, ConversationID: 10, AfterSeq: 100, Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 0 || page.ResyncRequired {
+		t.Fatalf("unexpected page: %+v", page)
+	}
+	seq, ok, _ := cursor.Get(context.Background(), 10, 1)
+	if !ok || seq != 100 {
+		t.Fatalf("expected cursor kept at 100, got %d exists=%v", seq, ok)
+	}
+}
+
+func TestListHistoryAfterExpiredCursorSignalsResync(t *testing.T) {
+	s := newTestService(nil)
+	// joined_seq=50：客户端游标 30 低于可见性下界
+	s.deps.Members = &fakeMemberChecker{member: &conversation.Member{
+		UserID: 1, ConversationID: 10, Status: conversation.MemberStatusNormal, JoinedSeq: 50,
+	}}
+	repo := s.deps.Messages.(*fakeMsgRepo)
+	repo.msgs = []Message{{MessageID: 1, Seq: 60, ConversationID: 10, SenderID: 1}}
+	cursor := s.deps.Cursors.(*fakeSyncCursor)
+
+	page, err := s.ListHistory(context.Background(), HistoryQuery{ActorID: 1, ConversationID: 10, AfterSeq: 30, Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !page.ResyncRequired {
+		t.Fatal("expected resync_required when cursor below visibility bound")
+	}
+	// 响应仍从可见区返回（老客户端忽略标志时行为不变）
+	if len(page.Items) != 1 || page.Items[0].Seq != 60 {
+		t.Fatalf("expected visible items, got %+v", page.Items)
+	}
+	// resync 场景不推进服务端游标（客户端全量重拉后重建）
+	if len(cursor.advances) != 0 {
+		t.Fatalf("cursor must not advance on resync, got %v", cursor.advances)
+	}
+}
+
+func TestListHistoryCursorWriteFailureDegrades(t *testing.T) {
+	s := newTestService(nil)
+	repo := s.deps.Messages.(*fakeMsgRepo)
+	repo.msgs = []Message{{MessageID: 1, Seq: 101, ConversationID: 10, SenderID: 1}}
+	cursor := s.deps.Cursors.(*fakeSyncCursor)
+	cursor.fail = true
+
+	// 游标写失败不影响查询结果（两层游标设计：记录可重建，查询基准是客户端游标）
+	page, err := s.ListHistory(context.Background(), HistoryQuery{ActorID: 1, ConversationID: 10, AfterSeq: 100, Limit: 20})
+	if err != nil {
+		t.Fatalf("query must succeed despite cursor failure, got %v", err)
+	}
+	if len(page.Items) != 1 || page.Items[0].Seq != 101 {
+		t.Fatalf("unexpected page: %+v", page)
 	}
 }
 

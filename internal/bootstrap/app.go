@@ -114,7 +114,7 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*App, err
 
 	// ---- Redis 组件 ----
 	wsTickets := redisinfra.NewWSTicketStore(rdb, scripts, cfg.Auth.TicketTTL, redisOpts)
-	recentCache := redisinfra.NewRecentMessageCache(rdb, scripts, cfg.Presence.RecentCacheTTL, cfg.Presence.RecentCacheMax, redisOpts)
+	cursors := redisinfra.NewCursorStore(rdb, scripts, redisOpts)
 	presence := redisinfra.NewPresenceRegistry(rdb, cfg.Presence.ConnHashTTL, cfg.Presence.UserSetTTL, redisOpts)
 	rateLimiter := redisinfra.NewRateLimiter(rdb, scripts, redisOpts)
 	rateLimiter.SetObservers(
@@ -150,7 +150,7 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*App, err
 		Messages:      msgRepo,
 		Members:       convos,
 		Conversations: convos,
-		RecentCache:   recentCache,
+		Cursors:       cursors,
 		Publisher:     kafkainfra.NewPublisher(producer, "ws-gateway"),
 		RateLimiter:   &rateLimiterAdapter{r: rateLimiter, cfg: cfg.Resilience},
 		FastIdem:      idemStore,
@@ -199,7 +199,7 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*App, err
 		Presence:    presence,
 		Pubsub:      pubsub,
 		WSTickets:   wsTickets,
-		RecentCache: recentCache,
+		Cursors:     cursors,
 		RateLimiter: rateLimiter,
 		IdemStore:   idemStore,
 

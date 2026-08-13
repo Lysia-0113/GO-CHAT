@@ -124,10 +124,6 @@ type PresenceConfig struct {
 	ConnHashTTL time.Duration `yaml:"conn_hash_ttl"`
 	// UserSetTTL 用户在线 ZSET 的 TTL
 	UserSetTTL time.Duration `yaml:"user_set_ttl"`
-	// RecentCacheTTL 最近消息缓存 TTL
-	RecentCacheTTL time.Duration `yaml:"recent_cache_ttl"`
-	// RecentCacheMax 每会话缓存的最大消息数
-	RecentCacheMax int `yaml:"recent_cache_max"`
 	// IdemProcessingTTL 消息入口快速幂等"处理中" TTL
 	IdemProcessingTTL time.Duration `yaml:"idem_processing_ttl"`
 	// IdemAcceptedTTL 幂等"已接受" TTL
@@ -274,8 +270,6 @@ func defaultConfig() *Config {
 		Presence: PresenceConfig{
 			ConnHashTTL:       90 * time.Second,
 			UserSetTTL:        3 * time.Minute,
-			RecentCacheTTL:    24 * time.Hour,
-			RecentCacheMax:    200,
 			IdemProcessingTTL: 5 * time.Second,
 			IdemAcceptedTTL:   10 * time.Minute,
 		},

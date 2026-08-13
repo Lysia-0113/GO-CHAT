@@ -99,11 +99,6 @@ var KafkaDLQ = prometheus.NewCounterVec(
 	[]string{"topic"},
 )
 
-// RecentCacheFallback 缓存回源次数。
-var RecentCacheFallback = prometheus.NewCounter(
-	prometheus.CounterOpts{Name: "recent_cache_fallback_total", Help: "缓存回源次数"},
-)
-
 // OnlineQueryFailed 在线状态查询失败数。
 var OnlineQueryFailed = prometheus.NewCounter(
 	prometheus.CounterOpts{Name: "online_query_failed_total", Help: "在线状态查询失败数"},
@@ -159,8 +154,8 @@ var OutboxOldestAge = prometheus.NewGaugeVec(
 // ---- 直方图（延迟分布，用于校准超时）----
 
 // DependencyDuration 依赖调用耗时（GOCHAT_RESILIENCE.md §4.2 超时校准）。
-// operation 取值：redis_recent_read / mysql_history_query / kafka:ingress_publish
-// / kafka:persisted_publish / kafka:dlq_publish。
+// operation 取值：redis_cursor_read / redis_cursor_write / mysql_history_query
+// / kafka:ingress_publish / kafka:persisted_publish / kafka:dlq_publish。
 // 桶位覆盖超时表：Redis 50ms、MySQL 200ms、Kafka 300ms 均在桶内。
 var DependencyDuration = prometheus.NewHistogramVec(
 	prometheus.HistogramOpts{
@@ -180,7 +175,7 @@ func New() *prometheus.Registry {
 		WSIngressReceived, PublishFailed, PushDropped, SlowConnectionClosed,
 		KafkaProducerError, KafkaProducerSend,
 		PersistSuccess, PersistRetry, PersistIdempotent, KafkaDLQ,
-		RecentCacheFallback, OnlineQueryFailed, PushToConnFailed, OutboxPublishError,
+		OnlineQueryFailed, PushToConnFailed, OutboxPublishError,
 		WSConnectionActive, IDSegmentRemaining, BreakerState, BulkheadQueueLength,
 		OutboxPending, OutboxOldestAge, DependencyDuration,
 	)

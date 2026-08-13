@@ -1,4 +1,4 @@
-// Package redis 是 Redis 基础设施：最近消息缓存、Presence、票据、幂等、限流。
+// Package redis 是 Redis 基础设施：同步游标、Presence、票据、幂等、限流。
 package redis
 
 import (
@@ -7,16 +7,11 @@ import (
 )
 
 // Key 约定：im:{领域}:{业务标识}:{用途}（GOCHAT_REDIS.md §2.2）。
-// 最近消息缓存的配对 Key 使用相同 Hash Tag {conversation_id}，保证 Lua 原子操作落在同一 Slot。
 
-// RecentIdxKey 最近消息 seq 索引 ZSET：score=seq，member=message_id。
-func RecentIdxKey(conversationID int64) string {
-	return fmt.Sprintf("im:recent:{%d}:idx", conversationID)
-}
-
-// RecentDataKey 最近消息快照 HASH：field=message_id，value=消息 JSON。
-func RecentDataKey(conversationID int64) string {
-	return fmt.Sprintf("im:recent:{%d}:data", conversationID)
+// CursorKey 会话同步游标 HASH：field=user_id，value=该用户已同步到的最新 seq。
+// 两层游标设计（GOCHAT_REDIS.md §10）：服务端记录，查询基准始终是客户端本地游标。
+func CursorKey(conversationID int64) string {
+	return fmt.Sprintf("im:cursor:%d", conversationID)
 }
 
 // PresenceUserKey 用户在线连接 ZSET：member=connection_id，score=过期毫秒时间戳。

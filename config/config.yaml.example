@@ -67,8 +67,6 @@ idgen:
 presence:
   conn_hash_ttl: 90s                  # 连接路由 HASH TTL（心跳 30s）
   user_set_ttl: 3m                    # 用户在线 ZSET TTL
-  recent_cache_ttl: 24h               # 最近消息缓存 TTL
-  recent_cache_max: 200               # 每会话缓存最大消息数
   idem_processing_ttl: 5s             # 幂等"处理中" TTL
   idem_accepted_ttl: 10m              # 幂等"已接受" TTL
 

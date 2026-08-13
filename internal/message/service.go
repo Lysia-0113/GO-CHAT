@@ -24,10 +24,11 @@ type Dependencies struct {
 	Messages      MessageRepository
 	Members       MemberChecker
 	Conversations ConversationState
-	RecentCache   RecentMessageCache
-	Publisher     MessagePublisher
-	RateLimiter   RateLimiter
-	FastIdem      FastIdempotency
+	// Cursors 是服务端同步游标记录（两层游标设计：客户端本地游标是真相）。
+	Cursors     SyncCursorStore
+	Publisher   MessagePublisher
+	RateLimiter RateLimiter
+	FastIdem    FastIdempotency
 	// IdemFallback 为 true 时，快速幂等不可用（Redis 故障）跳过拦截，
 	// 依赖 MySQL 唯一索引兜底（GOCHAT_REDIS.md §7.3）。
 	IdemFallback bool
@@ -130,7 +131,7 @@ func (s *Service) GetByClientMessageID(ctx context.Context, senderID int64, clie
 }
 
 // ListHistory 处理历史查询（before_seq）与离线补偿（after_seq）。
-// 优先级：Redis 最近消息缓存 → MySQL 降级（GOCHAT_REDIS.md §4.5）。
+// 读路径直连 MySQL（会话内 (conversation_id, seq) 复合主键切片），不经过缓存。
 func (s *Service) ListHistory(ctx context.Context, query HistoryQuery) (*MessagePage, error) {
 	if query.Limit <= 0 {
 		query.Limit = 20
@@ -159,13 +160,6 @@ func (s *Service) ListHistory(ctx context.Context, query HistoryQuery) (*Message
 }
 
 func (s *Service) listBefore(ctx context.Context, query HistoryQuery, visibleAfter int64) (*MessagePage, error) {
-	// 先尝试缓存（仅限最近窗口；complete=false 时回源 MySQL）
-	if s.deps.RecentCache != nil {
-		items, complete, err := s.deps.RecentCache.ListBefore(ctx, query.ConversationID, visibleAfter, query.BeforeSeq, query.Limit)
-		if err == nil && complete {
-			return &MessagePage{Items: items, NextBeforeSeq: nextBefore(items), HasMore: len(items) == query.Limit}, nil
-		}
-	}
 	items, err := s.deps.Messages.ListBefore(ctx, query.ConversationID, query.BeforeSeq, query.Limit)
 	if err != nil {
 		return nil, err
@@ -181,21 +175,39 @@ func (s *Service) listBefore(ctx context.Context, query HistoryQuery, visibleAft
 }
 
 func (s *Service) listAfter(ctx context.Context, query HistoryQuery, visibleAfter int64) (*MessagePage, error) {
+	// 游标过期：客户端本地游标低于可见性下界（刚入群/清空聊天记录），
+	// 置 resync_required 提示客户端清空本地副本全量重拉。
+	// 响应内容仍从可见区开始返回，老客户端忽略该标志时行为与旧版一致。
+	resync := query.AfterSeq < visibleAfter
 	after := query.AfterSeq
 	if visibleAfter > after {
 		after = visibleAfter
-	}
-	if s.deps.RecentCache != nil {
-		items, complete, err := s.deps.RecentCache.ListAfter(ctx, query.ConversationID, after, query.AfterSeq, query.Limit)
-		if err == nil && complete {
-			return &MessagePage{Items: items, NextAfterSeq: nextAfter(items), HasMore: len(items) == query.Limit}, nil
-		}
 	}
 	items, err := s.deps.Messages.ListAfter(ctx, query.ConversationID, after, query.Limit)
 	if err != nil {
 		return nil, err
 	}
-	return &MessagePage{Items: items, NextAfterSeq: nextAfter(items), HasMore: len(items) == query.Limit}, nil
+	page := &MessagePage{Items: items, NextAfterSeq: nextAfter(items), HasMore: len(items) == query.Limit, ResyncRequired: resync}
+	s.recordCursor(ctx, query, page)
+	return page, nil
+}
+
+// recordCursor 记录服务端同步游标（两层游标设计：仅记录，查询基准是客户端游标）。
+// 推进到本次响应覆盖的最大 seq；无新消息时保持客户端游标（说明已到最新）。
+// 写失败静默降级：游标是可重建的服务端记录，不影响本次查询结果。
+func (s *Service) recordCursor(ctx context.Context, query HistoryQuery, page *MessagePage) {
+	if s.deps.Cursors == nil || page.ResyncRequired {
+		// resync 场景不推进：客户端将全量重拉，由重拉后的增量请求重建游标
+		return
+	}
+	synced := page.NextAfterSeq
+	if synced == 0 {
+		synced = query.AfterSeq
+	}
+	if synced <= 0 {
+		return
+	}
+	_, _ = s.deps.Cursors.Advance(ctx, query.ConversationID, query.ActorID, synced)
 }
 
 func nextBefore(items []Message) int64 {

@@ -22,17 +22,14 @@ type MessageRepository interface {
 	AdvanceReadCursor(ctx context.Context, conversationID, userID, readSeq int64) error
 }
 
-// RecentMessageCache 是最近消息缓存接口（GOCHAT_API.md §12.4）。
-type RecentMessageCache interface {
-	// ListBefore 向前翻页读取缓存窗口内消息（descending）。
-	// complete=false 表示缓存缺失/不连续/超出窗口，调用方应回源 MySQL。
-	ListBefore(ctx context.Context, conversationID, visibleAfterSeq, beforeSeq int64, limit int) (items []Message, complete bool, err error)
-	// ListAfter 离线补偿读取（ascending）。
-	ListAfter(ctx context.Context, conversationID, visibleAfterSeq, afterSeq int64, limit int) (items []Message, complete bool, err error)
-	// Append 追加一条已持久化消息到缓存（ZSET + HASH + Lua 原子写）。
-	Append(ctx context.Context, m *Message) error
-	// Delete 清空某会话缓存。
-	Delete(ctx context.Context, conversationID int64) error
+// SyncCursorStore 是服务端同步游标存储（GOCHAT_REDIS.md §10）。
+// 两层游标设计：客户端本地游标是真相（查询基准），
+// 本接口只做服务端记录，写失败由调用方静默降级（不影响查询结果）。
+type SyncCursorStore interface {
+	// Advance 推进用户在某会话的同步游标（只增不减），返回推进后的值。
+	Advance(ctx context.Context, conversationID, userID, seq int64) (int64, error)
+	// Get 读取同步游标；不存在时返回 (0, false, nil)。
+	Get(ctx context.Context, conversationID, userID int64) (int64, bool, error)
 }
 
 // MessagePublisher 是消息事件发布接口（GOCHAT_API.md §12.5）。

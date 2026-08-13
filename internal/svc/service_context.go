@@ -47,7 +47,7 @@ type ServiceContext struct {
 	Presence    *redisinfra.PresenceRegistry
 	Pubsub      *redisinfra.PubsubGateway
 	WSTickets   *redisinfra.WSTicketStore
-	RecentCache *redisinfra.RecentMessageCache
+	Cursors     *redisinfra.CursorStore
 	RateLimiter *redisinfra.RateLimiter
 	IdemStore   *redisinfra.IdempotencyStore
 
