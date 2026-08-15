@@ -244,14 +244,28 @@ func baseSendCmd() SendMessageCommand {
 
 func TestSendValidation(t *testing.T) {
 	s := newTestService(nil)
+	base := baseSendCmd()
 
 	// 空 client_msg_id
 	_, err := s.Send(context.Background(), SendMessageCommand{SenderID: 1, ConversationID: 10, MessageType: TypeText, Content: textContent(t, "hi")})
 	if !errs.IsCode(err, errs.InvalidArgument) {
 		t.Fatalf("expected INVALID_ARGUMENT, got %v", err)
 	}
+	// 非 UUID client_msg_id：入口直接拒绝，不发布 ingress（否则持久化层无法落库）
+	badID := base
+	badID.ClientMessageID = "not-a-uuid"
+	_, err = s.Send(context.Background(), badID)
+	if !errs.IsCode(err, errs.InvalidArgument) {
+		t.Fatalf("expected INVALID_ARGUMENT for non-UUID client_msg_id, got %v", err)
+	}
+	pub := s.deps.Publisher.(*fakePublisher)
+	if pub.ingressCount() != 0 {
+		t.Fatalf("non-UUID client_msg_id must not publish ingress, got %d", pub.ingressCount())
+	}
 	// 空文本
-	_, err = s.Send(context.Background(), SendMessageCommand{SenderID: 1, ClientMessageID: "x", ConversationID: 10, MessageType: TypeText, Content: textContent(t, "")})
+	empty := base
+	empty.Content = textContent(t, "")
+	_, err = s.Send(context.Background(), empty)
 	if !errs.IsCode(err, errs.InvalidArgument) {
 		t.Fatalf("expected INVALID_ARGUMENT for empty text, got %v", err)
 	}
@@ -260,12 +274,16 @@ func TestSendValidation(t *testing.T) {
 	for i := range long {
 		long[i] = 'a'
 	}
-	_, err = s.Send(context.Background(), SendMessageCommand{SenderID: 1, ClientMessageID: "x", ConversationID: 10, MessageType: TypeText, Content: textContent(t, string(long))})
+	tooLong := base
+	tooLong.Content = textContent(t, string(long))
+	_, err = s.Send(context.Background(), tooLong)
 	if !errs.IsCode(err, errs.MessageTooLarge) {
 		t.Fatalf("expected MESSAGE_TOO_LARGE, got %v", err)
 	}
 	// 非文本类型（P0 只支持 text）
-	_, err = s.Send(context.Background(), SendMessageCommand{SenderID: 1, ClientMessageID: "x", ConversationID: 10, MessageType: TypeImage, Content: textContent(t, "hi")})
+	image := base
+	image.MessageType = TypeImage
+	_, err = s.Send(context.Background(), image)
 	if !errs.IsCode(err, errs.InvalidArgument) {
 		t.Fatalf("expected INVALID_ARGUMENT for image in P0, got %v", err)
 	}
@@ -454,9 +472,8 @@ func TestAckReceived(t *testing.T) {
 func TestSendProcessingBackoff(t *testing.T) {
 	s := newTestService(nil)
 	idem := s.deps.FastIdem.(*fakeIdem)
-	idem.state["cid-processing"] = IdemProcessing
 	cmd := baseSendCmd()
-	cmd.ClientMessageID = "cid-processing"
+	idem.state[cmd.ClientMessageID] = IdemProcessing
 	_, err := s.Send(context.Background(), cmd)
 	if !errs.IsCode(err, errs.SystemBusy) || !errs.As(err).Retryable {
 		t.Fatalf("expected retryable SYSTEM_BUSY, got %v", err)

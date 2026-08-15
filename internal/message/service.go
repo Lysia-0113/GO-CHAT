@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/Lysia-0113/GO-CHAT/internal/conversation"
 	"github.com/Lysia-0113/GO-CHAT/internal/errs"
 )
@@ -50,6 +52,11 @@ func NewService(deps Dependencies) *Service {
 func (s *Service) Send(ctx context.Context, cmd SendMessageCommand) (*SendMessageResult, error) {
 	if cmd.ClientMessageID == "" {
 		return nil, errs.New(errs.InvalidArgument, "client_msg_id 不能为空")
+	}
+	// 格式前置校验：非 UUID 直接拒绝，否则会 accepted 后无法落库
+	// （持久化层按 BINARY(16) 存储，格式错误会卡死分区重试）
+	if _, err := uuid.Parse(cmd.ClientMessageID); err != nil {
+		return nil, errs.New(errs.InvalidArgument, "client_msg_id 必须是 UUID")
 	}
 	if err := ValidateContent(cmd.MessageType, cmd.Content); err != nil {
 		return nil, err

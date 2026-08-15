@@ -13,6 +13,8 @@ import (
 	"errors"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/Lysia-0113/GO-CHAT/internal/errs"
 	kafkainfra "github.com/Lysia-0113/GO-CHAT/internal/infrastructure/kafka"
 	"github.com/Lysia-0113/GO-CHAT/internal/message"
@@ -158,6 +160,11 @@ func (w *Worker) handle(appCtx context.Context, msg kafkainfra.Message) (bool, e
 	}
 	if ingress.SenderID <= 0 || ingress.ClientMessageID == "" || ingress.ConversationID <= 0 {
 		return w.dlqAndCommit(appCtx, msg, env, "INVALID_ARGUMENT", "ingress 缺少必要字段", 0)
+	}
+	// 格式兜底校验：历史坏消息/绕过网关的发布方可能携带非 UUID，
+	// 归类永久错误进 DLQ，避免 handleWithRetry 无限重试卡死分区
+	if _, err := uuid.Parse(ingress.ClientMessageID); err != nil {
+		return w.dlqAndCommit(appCtx, msg, env, "INVALID_ARGUMENT", "client_msg_id 不是合法 UUID", 0)
 	}
 	if err := message.ValidateContent(ingress.MessageType, ingress.Content); err != nil {
 		return w.dlqAndCommit(appCtx, msg, env, string(errs.As(err).Code), errs.As(err).Message, 0)
