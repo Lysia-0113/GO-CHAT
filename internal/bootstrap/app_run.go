@@ -21,6 +21,7 @@ import (
 	httptransport "github.com/Lysia-0113/GO-CHAT/internal/transport/http"
 	"github.com/Lysia-0113/GO-CHAT/internal/transport/websocket"
 	"github.com/Lysia-0113/GO-CHAT/internal/worker/deliver"
+	"github.com/Lysia-0113/GO-CHAT/internal/worker/dlq"
 	"github.com/Lysia-0113/GO-CHAT/internal/worker/outbox"
 	"github.com/Lysia-0113/GO-CHAT/internal/worker/persist"
 )
@@ -36,9 +37,10 @@ type App struct {
 func (a *App) Run(appCtx context.Context) error {
 	// ---- Worker 启动 ----
 	persistWorker := persist.New(a.svcCtx, persist.Config{
-		MaxRetries: a.svcCtx.Config.Kafka.PersistMaxRetries,
-		Backoff:    a.svcCtx.Config.Kafka.PersistBackoff,
-		TxTimeout:  a.svcCtx.Config.Resilience.PersistTxTimeout,
+		MaxRetries:    a.svcCtx.Config.Kafka.PersistMaxRetries,
+		Backoff:       a.svcCtx.Config.Kafka.PersistBackoff,
+		TxTimeout:     a.svcCtx.Config.Resilience.PersistTxTimeout,
+		NumPartitions: a.svcCtx.Config.Kafka.NumPartitions,
 	})
 	outboxPublisher := outbox.New(a.svcCtx, outbox.Config{
 		MaxRetries:   a.svcCtx.Config.Kafka.OutboxMaxRetries,
@@ -48,15 +50,20 @@ func (a *App) Run(appCtx context.Context) error {
 		InstanceID:   a.svcCtx.Config.Server.NodeID,
 	})
 	deliverWorker := deliver.New(a.svcCtx)
+	dlqWorker := dlq.New(a.svcCtx)
 
-	// 多实例取同一个 Consumer Group 时，每个实例各启动一份 Worker
-	for i := 0; i < a.svcCtx.Config.Resilience.PersistWorkers; i++ {
-		go func() {
-			if err := persistWorker.Run(appCtx); err != nil {
-				a.svcCtx.Log.Error("persist worker exited", "error", err.Error())
-			}
-		}()
-	}
+	// persist：1 个分发 goroutine + 每分区 1 个处理 goroutine（按分区串行，保证会话顺序）
+	go func() {
+		if err := persistWorker.Run(appCtx); err != nil {
+			a.svcCtx.Log.Error("persist worker exited", "error", err.Error())
+		}
+	}()
+	// dlq：最小版死信消费者（计数+提交，无重放/落表）
+	go func() {
+		if err := dlqWorker.Run(appCtx); err != nil {
+			a.svcCtx.Log.Error("dlq worker exited", "error", err.Error())
+		}
+	}()
 	for i := 0; i < a.svcCtx.Config.Resilience.DeliveryWorkers; i++ {
 		go func() {
 			if err := deliverWorker.Run(appCtx); err != nil {
@@ -139,6 +146,7 @@ func (a *App) Run(appCtx context.Context) error {
 	}
 	a.svcCtx.PersistConsumer.Close()
 	a.svcCtx.DeliverConsumer.Close()
+	a.svcCtx.DLQConsumer.Close()
 	a.svcCtx.Kafka.Close()
 	if sqlDB, err := a.svcCtx.DB.DB(); err == nil {
 		_ = sqlDB.Close()

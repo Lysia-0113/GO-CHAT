@@ -115,7 +115,7 @@ func (h *Handler) onSend(ctx context.Context, conn *Conn, env inbound) {
 	if eerr == nil {
 		event.RequestID = env.RequestID
 		if err := conn.Push(ctx, event); err != nil {
-			metrics.PushDropped.Inc()
+			metrics.PushDropped.WithLabelValues("message.accepted").Inc()
 		}
 	}
 }
@@ -222,6 +222,6 @@ func (h *Handler) writeError(conn *Conn, requestID string, err error) {
 	event.RequestID = requestID
 	if err := conn.Push(context.Background(), event); err != nil {
 		// 错误告知本身也可能被丢弃：客户端靠超时 + 幂等重试兜底
-		metrics.PushDropped.Inc()
+		metrics.PushDropped.WithLabelValues("error").Inc()
 	}
 }

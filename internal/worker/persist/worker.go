@@ -1,6 +1,10 @@
 // Package persist 是 Kafka 到 MySQL 的持久化 Worker
 // （GOCHAT_KAFKA.md §7）：按会话顺序落库、sender_id+client_msg_id 幂等、
 // MySQL 事务提交后才提交 Offset。
+//
+// 顺序保证：生产者按 conversation_id 哈希分区，同一会话进入同一分区；
+// 本 Worker 按分区号路由到独立的处理 goroutine，同分区消息串行落库，
+// 从而保证 seq 分配顺序 = 发送顺序（并发抢锁会导致 seq 颠倒，见 §7.2）。
 package persist
 
 import (
@@ -16,59 +20,123 @@ import (
 	"github.com/Lysia-0113/GO-CHAT/internal/svc"
 )
 
+// partChannelSize 每分区处理队列容量；满时分发层阻塞形成 Kafka 背压。
+const partChannelSize = 128
+
 // Worker 持久化 Worker。依赖经 svcCtx 服务定位器取用（GOCHAT_API.md §11.3）。
 type Worker struct {
-	svcCtx     *svc.ServiceContext
-	publisher  message.MessagePublisher // 本 Worker 专用的 persisted 发布器
-	maxRetries int
-	backoff    time.Duration
-	txTimeout  time.Duration
+	svcCtx        *svc.ServiceContext
+	publisher     message.MessagePublisher // 本 Worker 专用的 persisted 发布器
+	maxRetries    int
+	backoff       time.Duration
+	txTimeout     time.Duration
+	numPartitions int
 }
 
 // Config 是 Worker 配置。
 type Config struct {
-	MaxRetries int
-	Backoff    time.Duration
-	TxTimeout  time.Duration
+	MaxRetries    int
+	Backoff       time.Duration
+	TxTimeout     time.Duration
+	NumPartitions int
 }
 
 // New 创建持久化 Worker。
 func New(svcCtx *svc.ServiceContext, cfg Config) *Worker {
+	if cfg.NumPartitions <= 0 {
+		cfg.NumPartitions = 3
+	}
 	return &Worker{
-		svcCtx:     svcCtx,
-		publisher:  kafkainfra.NewPublisher(svcCtx.Kafka, "persist-worker"),
-		maxRetries: cfg.MaxRetries,
-		backoff:    cfg.Backoff,
-		txTimeout:  cfg.TxTimeout,
+		svcCtx:        svcCtx,
+		publisher:     kafkainfra.NewPublisher(svcCtx.Kafka, "persist-worker"),
+		maxRetries:    cfg.MaxRetries,
+		backoff:       cfg.Backoff,
+		txTimeout:     cfg.TxTimeout,
+		numPartitions: cfg.NumPartitions,
 	}
 }
 
 // Run 消费 im.message.ingress 直至 ctx 取消。
 // 返回 nil 表示优雅退出。
+//
+// 并发模型：1 个分发 goroutine 拉取消息并按分区号投递到 per-partition 队列，
+// 每个分区 1 个处理 goroutine 串行落库。同一分区（同一会话）的消息严格串行，
+// 从根上避免并发抢锁导致的 seq 颠倒与跳跃提交丢消息。
 func (w *Worker) Run(appCtx context.Context) error {
-	for {
-		msg, err := w.svcCtx.PersistConsumer.FetchMessage(appCtx)
-		if err != nil {
-			if appCtx.Err() != nil {
-				return nil // 优雅退出
-			}
-			w.svcCtx.Log.Error("persist fetch failed", "error", err.Error())
-			select {
-			case <-appCtx.Done():
-				return nil
-			case <-time.After(500 * time.Millisecond):
-			}
-			continue
-		}
+	partChans := make([]chan kafkainfra.Message, w.numPartitions)
+	for p := range partChans {
+		partChans[p] = make(chan kafkainfra.Message, partChannelSize)
+	}
 
+	// 分发层：单 goroutine 拉取，按分区号投递（队列满时阻塞 = Kafka 背压）
+	go func() {
+		for {
+			msg, err := w.svcCtx.PersistConsumer.FetchMessage(appCtx)
+			if err != nil {
+				if appCtx.Err() != nil {
+					return // 优雅退出
+				}
+				w.svcCtx.Log.Error("persist fetch failed", "error", err.Error())
+				select {
+				case <-appCtx.Done():
+					return
+				case <-time.After(500 * time.Millisecond):
+				}
+				continue
+			}
+			// 路由键 = 分区号；配置与实际不一致时按取模兜底（同分区仍同队列，顺序保持）
+			idx := int(msg.Partition) % w.numPartitions
+			if int(msg.Partition) >= w.numPartitions {
+				w.svcCtx.Log.Warn("partition exceeds configured count",
+					"partition", msg.Partition, "configured", w.numPartitions)
+			}
+			select {
+			case partChans[idx] <- msg:
+			case <-appCtx.Done():
+				return
+			}
+		}
+	}()
+
+	// 处理层：每分区一个 goroutine，串行 handle（失败重试，不跳过）
+	for p := range partChans {
+		go func(p int) {
+			for {
+				select {
+				case <-appCtx.Done():
+					return
+				case msg := <-partChans[p]:
+					if err := w.handleWithRetry(appCtx, msg); err != nil {
+						// 仅当 ctx 取消时返回；其余失败在 handleWithRetry 内退避重试
+						w.svcCtx.Log.Error("partition worker stopped",
+							"partition", p, "error", err.Error())
+						return
+					}
+				}
+			}
+		}(p)
+	}
+
+	<-appCtx.Done()
+	return nil
+}
+
+// handleWithRetry 串行处理一条消息；失败时退避重试直到成功或 ctx 取消。
+// 不能跳过失败消息：跳过会导致 offset 跳跃提交，失败消息静默丢失。
+// 持续失败时该分区积压，由 LAG 告警兜底（宁可卡住，不可丢）。
+func (w *Worker) handleWithRetry(appCtx context.Context, msg kafkainfra.Message) error {
+	for {
 		handled, hErr := w.handle(appCtx, msg)
-		if hErr != nil {
-			// 处理失败：不提交 Offset（Kafka 会重新投递，数据库幂等去重）
-			w.svcCtx.Log.Error("persist handle failed",
-				"topic", msg.Topic, "partition", msg.Partition, "offset", msg.Offset,
-				"error", hErr.Error(),
-				"committed", handled,
-			)
+		if hErr == nil {
+			return nil
+		}
+		w.svcCtx.Log.Error("persist handle failed",
+			"topic", msg.Topic, "partition", msg.Partition, "offset", msg.Offset,
+			"error", hErr.Error(), "committed", handled)
+		select {
+		case <-appCtx.Done():
+			return appCtx.Err()
+		case <-time.After(2 * time.Second):
 		}
 	}
 }
@@ -198,7 +266,7 @@ func (w *Worker) dlqAndCommit(ctx context.Context, msg kafkainfra.Message, env k
 	if err := w.svcCtx.Kafka.PublishDLQ(ctx, dlqEnv); err != nil {
 		w.svcCtx.Log.Error("dlq publish failed", "error", err.Error())
 	}
-	metrics.KafkaDLQ.WithLabelValues(msg.Topic).Inc()
+	metrics.KafkaDLQ.WithLabelValues(msg.Topic, code).Inc()
 	if err := w.svcCtx.PersistConsumer.CommitMessages(ctx, msg); err != nil {
 		return false, err
 	}

@@ -21,6 +21,7 @@ kafka:
   # 当前消费者实现使用固定的 8MiB 单次读取上限；该值用于保留低配
   # 部署的批量意图，后续接入可配置 reader 时直接生效。
   max_poll_records: 20
+  num_partitions: 3                   # ingress 分区数（persist worker 按分区路由）
   outbox_batch_size: 20
 
 auth:
@@ -31,7 +32,6 @@ auth:
 resilience:
   history_query_concurrency: 8
   ws_ingress_concurrency: 8
-  persist_workers: 2
   outbox_workers: 1
   delivery_workers: 2
   group_fanout_concurrency: 2

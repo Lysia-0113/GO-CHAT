@@ -79,4 +79,5 @@ type ServiceContext struct {
 	// 消费者（生命周期归 svcCtx，优雅退出时统一关闭）
 	PersistConsumer *kafkainfra.Consumer
 	DeliverConsumer *kafkainfra.Consumer
+	DLQConsumer     *kafkainfra.Consumer
 }

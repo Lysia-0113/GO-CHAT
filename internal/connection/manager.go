@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+
+	"github.com/Lysia-0113/GO-CHAT/internal/metrics"
 )
 
 // Connection 是网关持有的单个 WebSocket 连接抽象。
@@ -117,6 +119,9 @@ func (m *Manager) PushToUser(ctx context.Context, userID int64, event Event) int
 	for _, c := range conns {
 		if err := c.Push(ctx, event); err == nil {
 			delivered++
+		} else {
+			// 队列满/连接关闭：按事件类型分桶计数（GOCHAT_RESILIENCE.md §11.1）
+			metrics.PushDropped.WithLabelValues(event.Event).Inc()
 		}
 	}
 	return delivered

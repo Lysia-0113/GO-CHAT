@@ -39,10 +39,12 @@ kafka:
   producer_acks_all: true             # acks=all + min.insync.replicas 配合
   persist_group: "gochat-message-persist-v1"
   delivery_group: "gochat-message-delivery-v1"
+  dlq_group: "gochat-message-dlq-v1"  # 死信消费组（最小版：仅计数+提交 offset）
   auto_offset_reset: "earliest"       # 新环境 replay 需求：earliest / latest
   max_poll_records: 100
   persist_max_retries: 5              # MySQL 持久化临时失败重试上限
   persist_backoff: 200ms
+  num_partitions: 3                   # ingress 分区数（persist worker 按分区路由，保证同分区串行）
   outbox_max_retries: 10              # Outbox 发布失败最大重试，超出进入死信
   outbox_backoff: 2s
   outbox_poll_interval: 500ms
@@ -96,7 +98,6 @@ resilience:
   # 隔离并发（Semaphore / Worker 数）
   history_query_concurrency: 32
   ws_ingress_concurrency: 32
-  persist_workers: 8
   outbox_workers: 4
   delivery_workers: 8
   group_fanout_concurrency: 4

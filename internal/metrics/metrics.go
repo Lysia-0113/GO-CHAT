@@ -56,9 +56,10 @@ var PublishFailed = prometheus.NewCounter(
 	prometheus.CounterOpts{Name: "publish_failed_total", Help: "Kafka 发布失败数"},
 )
 
-// PushDropped 回执推送丢弃数。
-var PushDropped = prometheus.NewCounter(
-	prometheus.CounterOpts{Name: "push_dropped_total", Help: "回执推送丢弃数"},
+// PushDropped 出站推送丢弃数（按事件类型区分维度：message.accepted/message.read/error 等）。
+var PushDropped = prometheus.NewCounterVec(
+	prometheus.CounterOpts{Name: "push_dropped_total", Help: "出站推送丢弃数"},
+	[]string{"event"},
 )
 
 // SlowConnectionClosed 慢连接断开数。
@@ -93,10 +94,10 @@ var PersistIdempotent = prometheus.NewCounter(
 	prometheus.CounterOpts{Name: "persist_idempotent_total", Help: "重复消费命中"},
 )
 
-// KafkaDLQ 进入死信的事件数。
+// KafkaDLQ 进入死信的事件数（按 topic 与错误码区分维度）。
 var KafkaDLQ = prometheus.NewCounterVec(
 	prometheus.CounterOpts{Name: "kafka_dlq_total", Help: "进入死信的事件数"},
-	[]string{"topic"},
+	[]string{"topic", "code"},
 )
 
 // OnlineQueryFailed 在线状态查询失败数。

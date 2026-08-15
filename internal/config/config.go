@@ -80,12 +80,16 @@ type KafkaConfig struct {
 	// Consumer Group 名
 	PersistGroup  string `yaml:"persist_group"`
 	DeliveryGroup string `yaml:"delivery_group"`
+	// DLQGroup 死信队列消费组（最小版消费者：仅计数，/metrics 可查）
+	DLQGroup string `yaml:"dlq_group"`
 	// Consumer 配置
 	AutoOffsetReset string `yaml:"auto_offset_reset"`
 	MaxPollRecords  int    `yaml:"max_poll_records"`
 	// 持久化失败重试：最大次数 + 退避序列
 	PersistMaxRetries int           `yaml:"persist_max_retries"`
 	PersistBackoff    time.Duration `yaml:"persist_backoff"`
+	// NumPartitions ingress topic 分区数（persist worker 按分区路由，保证同分区串行）
+	NumPartitions int `yaml:"num_partitions"`
 	// Outbox Publisher 配置
 	OutboxMaxRetries   int           `yaml:"outbox_max_retries"`
 	OutboxBackoff      time.Duration `yaml:"outbox_backoff"`
@@ -156,7 +160,6 @@ type ResilienceConfig struct {
 	// 隔离并发（GOCHAT_RESILIENCE.md §6.1）
 	HistoryQueryConcurrency int `yaml:"history_query_concurrency"`
 	WSIngressConcurrency    int `yaml:"ws_ingress_concurrency"`
-	PersistWorkers          int `yaml:"persist_workers"`
 	OutboxWorkers           int `yaml:"outbox_workers"`
 	DeliveryWorkers         int `yaml:"delivery_workers"`
 	GroupFanoutConcurrency  int `yaml:"group_fanout_concurrency"`
@@ -242,10 +245,12 @@ func defaultConfig() *Config {
 			ProducerAcksAll:    true,
 			PersistGroup:       "gochat-message-persist-v1",
 			DeliveryGroup:      "gochat-message-delivery-v1",
+			DLQGroup:           "gochat-message-dlq-v1",
 			AutoOffsetReset:    "earliest",
 			MaxPollRecords:     100,
 			PersistMaxRetries:  5,
 			PersistBackoff:     200 * time.Millisecond,
+			NumPartitions:      3,
 			OutboxMaxRetries:   10,
 			OutboxBackoff:      2 * time.Second,
 			OutboxPollInterval: 500 * time.Millisecond,
@@ -296,7 +301,6 @@ func defaultConfig() *Config {
 
 			HistoryQueryConcurrency: 32,
 			WSIngressConcurrency:    32,
-			PersistWorkers:          8,
 			OutboxWorkers:           4,
 			DeliveryWorkers:         8,
 			GroupFanoutConcurrency:  4,

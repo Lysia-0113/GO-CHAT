@@ -184,6 +184,19 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*App, err
 	if err != nil {
 		return nil, fmt.Errorf("kafka deliver consumer: %w", err)
 	}
+	dlqConsumer, err := kafkainfra.NewConsumer(kafkainfra.ConsumerConfig{
+		Brokers:          cfg.Kafka.Brokers,
+		Topic:            topics.DLQ(),
+		Group:            cfg.Kafka.DLQGroup,
+		StartOffset:      cfg.Kafka.AutoOffsetReset,
+		MaxBytes:         8 * 1024 * 1024,
+		SessionTimeout:   10 * time.Second,
+		RebalanceTimeout: 10 * time.Second,
+		Logger:           kafkainfra.SlogLogger(log),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("kafka dlq consumer: %w", err)
+	}
 
 	// ---- ServiceContext（服务定位器，GOCHAT_API.md §11.3） ----
 	// 全量依赖在此装配一次；传输层 / Worker 经 svcCtx 取用。
@@ -225,6 +238,7 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*App, err
 
 		PersistConsumer: persistConsumer,
 		DeliverConsumer: deliverConsumer,
+		DLQConsumer:     dlqConsumer,
 	}
 
 	return &App{
