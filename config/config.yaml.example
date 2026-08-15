@@ -44,7 +44,7 @@ kafka:
   max_poll_records: 100
   persist_max_retries: 5              # MySQL 持久化临时失败重试上限
   persist_backoff: 200ms
-  num_partitions: 3                   # ingress 分区数（persist worker 按分区路由，保证同分区串行）
+  num_partitions: 3                   # ingress/persisted 分区数（persist/deliver worker 按分区路由，保证同分区串行）
   outbox_max_retries: 10              # Outbox 发布失败最大重试，超出进入死信
   outbox_backoff: 2s
   outbox_poll_interval: 500ms
@@ -99,7 +99,6 @@ resilience:
   history_query_concurrency: 32
   ws_ingress_concurrency: 32
   outbox_workers: 4
-  delivery_workers: 8
   group_fanout_concurrency: 4
 
   # 熔断器，按 依赖:操作 维度

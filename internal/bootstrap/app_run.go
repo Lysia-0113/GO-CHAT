@@ -49,7 +49,9 @@ func (a *App) Run(appCtx context.Context) error {
 		BatchSize:    a.svcCtx.Config.Kafka.OutboxBatchSize,
 		InstanceID:   a.svcCtx.Config.Server.NodeID,
 	})
-	deliverWorker := deliver.New(a.svcCtx)
+	deliverWorker := deliver.New(a.svcCtx, deliver.Config{
+		NumPartitions: a.svcCtx.Config.Kafka.NumPartitions,
+	})
 	dlqWorker := dlq.New(a.svcCtx)
 
 	// persist：1 个分发 goroutine + 每分区 1 个处理 goroutine（按分区串行，保证会话顺序）
@@ -64,13 +66,12 @@ func (a *App) Run(appCtx context.Context) error {
 			a.svcCtx.Log.Error("dlq worker exited", "error", err.Error())
 		}
 	}()
-	for i := 0; i < a.svcCtx.Config.Resilience.DeliveryWorkers; i++ {
-		go func() {
-			if err := deliverWorker.Run(appCtx); err != nil {
-				a.svcCtx.Log.Error("deliver worker exited", "error", err.Error())
-			}
-		}()
-	}
+	// deliver：与 persist 相同的分区串行模型（1 分发 + 每分区 1 处理）
+	go func() {
+		if err := deliverWorker.Run(appCtx); err != nil {
+			a.svcCtx.Log.Error("deliver worker exited", "error", err.Error())
+		}
+	}()
 	for i := 0; i < a.svcCtx.Config.Resilience.OutboxWorkers; i++ {
 		go func() {
 			if err := outboxPublisher.Run(appCtx); err != nil {

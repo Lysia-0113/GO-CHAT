@@ -161,7 +161,6 @@ type ResilienceConfig struct {
 	HistoryQueryConcurrency int `yaml:"history_query_concurrency"`
 	WSIngressConcurrency    int `yaml:"ws_ingress_concurrency"`
 	OutboxWorkers           int `yaml:"outbox_workers"`
-	DeliveryWorkers         int `yaml:"delivery_workers"`
 	GroupFanoutConcurrency  int `yaml:"group_fanout_concurrency"`
 
 	// 熔断（GOCHAT_RESILIENCE.md §7.3），按 依赖:操作 配置
@@ -302,7 +301,6 @@ func defaultConfig() *Config {
 			HistoryQueryConcurrency: 32,
 			WSIngressConcurrency:    32,
 			OutboxWorkers:           4,
-			DeliveryWorkers:         8,
 			GroupFanoutConcurrency:  4,
 
 			Breakers: []BreakerConfig{
