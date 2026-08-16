@@ -170,13 +170,20 @@ func (w *Worker) handle(appCtx context.Context, msg kafkainfra.Message) (bool, e
 		return w.dlqAndCommit(appCtx, msg, env, string(errs.As(err).Code), errs.As(err).Message, 0)
 	}
 
+	// 查询会话成员快照（1× 查询，位于事务外）：随 persisted 事件携带，
+	// 广播投递侧零查询扇出。失败可重试，无副作用。
+	memberIDs, err := w.svcCtx.ConvRepo.ListMemberIDs(appCtx, ingress.ConversationID)
+	if err != nil {
+		return false, err
+	}
+
 	// 2. 幂等检查：已存在则复用原结果并重新发布 persisted（GOCHAT_DATABASE.md §10）
 	existing, err := w.svcCtx.MsgRepo.FindByClientMessageID(appCtx, ingress.SenderID, ingress.ClientMessageID)
 	if err != nil {
 		return false, err
 	}
 	if existing != nil {
-		if err := w.publisher.PublishPersisted(appCtx, toPersistedEvent(existing)); err != nil {
+		if err := w.publisher.PublishPersisted(appCtx, toPersistedEvent(existing, memberIDs)); err != nil {
 			return false, err
 		}
 		metrics.PersistIdempotent.Inc()
@@ -218,7 +225,7 @@ func (w *Worker) handle(appCtx context.Context, msg kafkainfra.Message) (bool, e
 		}
 
 		persistCtx, cancel := context.WithTimeout(appCtx, w.txTimeout)
-		persisted, perr := w.svcCtx.MsgRepo.Persist(persistCtx, message.PersistInput{Message: msgDomain})
+		persisted, perr := w.svcCtx.MsgRepo.Persist(persistCtx, message.PersistInput{Message: msgDomain, MemberIDs: memberIDs})
 		cancel()
 
 		if perr == nil {
@@ -318,7 +325,7 @@ func parseConvID(s string) int64 {
 }
 
 // toPersistedEvent 把已持久化消息转换为 persisted 事件。
-func toPersistedEvent(m *message.Message) message.MessagePersistedEvent {
+func toPersistedEvent(m *message.Message, memberIDs []int64) message.MessagePersistedEvent {
 	return message.MessagePersistedEvent{
 		MessageID:       m.MessageID,
 		Seq:             m.Seq,
@@ -329,5 +336,6 @@ func toPersistedEvent(m *message.Message) message.MessagePersistedEvent {
 		Content:         m.Content,
 		ContentPreview:  m.ContentPreview,
 		CreatedAt:       m.CreatedAt,
+		MemberIDs:       memberIDs,
 	}
 }

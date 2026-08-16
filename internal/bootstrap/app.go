@@ -124,7 +124,6 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*App, err
 		func(key string) { metrics.RateLimitL1Fallback.Inc() },
 	)
 	idemStore := redisinfra.NewIdempotencyStore(rdb, scripts, cfg.Presence.IdemProcessingTTL, cfg.Presence.IdemAcceptedTTL, redisOpts)
-	pubsub := redisinfra.NewPubsubGateway(rdb, cfg.Server.NodeID, redisOpts)
 
 	// ---- Service ----
 	users := user.NewService(user.Dependencies{
@@ -172,9 +171,10 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*App, err
 		return nil, fmt.Errorf("kafka persist consumer: %w", err)
 	}
 	deliverConsumer, err := kafkainfra.NewConsumer(kafkainfra.ConsumerConfig{
-		Brokers:          cfg.Kafka.Brokers,
-		Topic:            topics.Persisted(),
-		Group:            cfg.Kafka.DeliveryGroup,
+		Brokers: cfg.Kafka.Brokers,
+		Topic:   topics.Persisted(),
+		// 广播模型：每节点独立消费者组（组名带 node_id），各自消费全部分区
+		Group:            cfg.Kafka.DeliveryGroup + "-" + cfg.Server.NodeID,
 		StartOffset:      cfg.Kafka.AutoOffsetReset,
 		MaxBytes:         8 * 1024 * 1024,
 		SessionTimeout:   10 * time.Second,
@@ -210,7 +210,6 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*App, err
 		Topics: topics,
 
 		Presence:    presence,
-		Pubsub:      pubsub,
 		WSTickets:   wsTickets,
 		Cursors:     cursors,
 		RateLimiter: rateLimiter,

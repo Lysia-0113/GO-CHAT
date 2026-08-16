@@ -64,10 +64,5 @@ func RateWSConnectUserKey(userID int64) string {
 	return fmt.Sprintf("im:rate:ws:user:%d", userID)
 }
 
-// GatewayChannel 按 node_id 划分的 Pub/Sub 投递通道（GOCHAT_REDIS.md §9.1）。
-func GatewayChannel(nodeID string) string {
-	return fmt.Sprintf("im:gateway:%s", nodeID)
-}
-
 // IDString 将 int64 转为十进制字符串（供 Redis JSON 快照使用）。
 func IDString(id int64) string { return strconv.FormatInt(id, 10) }

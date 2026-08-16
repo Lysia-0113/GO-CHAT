@@ -26,7 +26,7 @@ type Service struct {
 
 func NewService(deps Dependencies) *Service {
 	if deps.MaxGroupMembers <= 0 {
-		deps.MaxGroupMembers = 500
+		deps.MaxGroupMembers = 1024
 	}
 	return &Service{deps: deps}
 }

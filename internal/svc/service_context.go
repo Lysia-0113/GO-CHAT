@@ -45,7 +45,6 @@ type ServiceContext struct {
 
 	// Redis 组件
 	Presence    *redisinfra.PresenceRegistry
-	Pubsub      *redisinfra.PubsubGateway
 	WSTickets   *redisinfra.WSTicketStore
 	Cursors     *redisinfra.CursorStore
 	RateLimiter *redisinfra.RateLimiter

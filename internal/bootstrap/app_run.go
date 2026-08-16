@@ -14,7 +14,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	kafkago "github.com/segmentio/kafka-go"
 
-	"github.com/Lysia-0113/GO-CHAT/internal/connection"
 	"github.com/Lysia-0113/GO-CHAT/internal/infrastructure/idgen/segment"
 	"github.com/Lysia-0113/GO-CHAT/internal/metrics"
 	"github.com/Lysia-0113/GO-CHAT/internal/svc"
@@ -78,25 +77,6 @@ func (a *App) Run(appCtx context.Context) error {
 				a.svcCtx.Log.Error("outbox publisher exited", "error", err.Error())
 			}
 		}()
-	}
-
-	// ---- 跨节点 Pub/Sub 投递订阅（本节点网关） ----
-	if a.svcCtx.Pubsub != nil {
-		deliveryCh, err := a.svcCtx.Pubsub.Subscribe(appCtx)
-		if err == nil {
-			go func() {
-				for ev := range deliveryCh {
-					for _, connID := range ev.ConnectionIDs {
-						_ = a.svcCtx.ConnManager.PushToConnection(appCtx, connID, connection.Event{
-							Event: ev.EventName,
-							Data:  ev.Data,
-						})
-					}
-				}
-			}()
-		} else {
-			a.svcCtx.Log.Warn("pubsub subscribe failed", "error", err.Error())
-		}
 	}
 
 	// ---- 指标循环（号段库存、熔断状态、Outbox 积压） ----

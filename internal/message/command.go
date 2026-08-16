@@ -74,6 +74,9 @@ type MarkReadCommand struct {
 // Message 已分配 message_id，seq 由事务内 last_seq+1 计算。
 type PersistInput struct {
 	Message *Message
+	// MemberIDs 是发送时刻的会话成员快照，随 outbox 事件写入，
+	// 供广播投递侧零查询扇出（旧事件为空时投递侧回退查库）。
+	MemberIDs []int64
 }
 
 // MessageIngressEvent 是 im.message.ingress 载荷（GOCHAT_KAFKA.md §5.2）。
@@ -97,6 +100,8 @@ type MessagePersistedEvent struct {
 	Content         json.RawMessage `json:"content"`
 	ContentPreview  string          `json:"content_preview,omitempty"`
 	CreatedAt       time.Time       `json:"created_at"`
+	// MemberIDs 是发送时刻的会话成员快照（广播投递用；旧事件为空时投递侧回退查库）。
+	MemberIDs []int64 `json:"member_ids,omitempty"`
 }
 
 // ReadEvent 是已读推进通知（message.read）。

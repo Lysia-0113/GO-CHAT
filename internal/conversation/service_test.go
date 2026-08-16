@@ -120,6 +120,29 @@ func TestCreateSingleChat(t *testing.T) {
 	}
 }
 
+func TestCreateGroupMemberCap(t *testing.T) {
+	s := newTestService()
+	// 上限内（默认 1024，含创建者）允许创建
+	ids := make([]int64, 0, 1023)
+	for i := int64(2); i <= 1024; i++ {
+		ids = append(ids, i)
+	}
+	_, created, err := s.Create(context.Background(), CreateConversationCommand{
+		SenderID: 1, Type: TypeGroup, Name: "cap-ok", MemberIDs: ids,
+	})
+	if err != nil || !created {
+		t.Fatalf("expected created within cap, err=%v", err)
+	}
+	// 超出上限拒绝（1023 成员 + 创建者 = 1024 是上限，再多一个拒绝）
+	over := append(ids, 1025)
+	_, _, err = s.Create(context.Background(), CreateConversationCommand{
+		SenderID: 1, Type: TypeGroup, Name: "cap-over", MemberIDs: over,
+	})
+	if !errs.IsCode(err, errs.InvalidArgument) {
+		t.Fatalf("expected INVALID_ARGUMENT over cap, got %v", err)
+	}
+}
+
 func TestCreateGroupRequiresName(t *testing.T) {
 	s := newTestService()
 	_, _, err := s.Create(context.Background(), CreateConversationCommand{

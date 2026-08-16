@@ -100,21 +100,6 @@ var KafkaDLQ = prometheus.NewCounterVec(
 	[]string{"topic", "code"},
 )
 
-// OnlineQueryFailed 在线状态查询失败数。
-var OnlineQueryFailed = prometheus.NewCounter(
-	prometheus.CounterOpts{Name: "online_query_failed_total", Help: "在线状态查询失败数"},
-)
-
-// PushToConnFailed 投递推送失败数。
-var PushToConnFailed = prometheus.NewCounter(
-	prometheus.CounterOpts{Name: "push_to_connection_failed_total", Help: "投递推送失败数"},
-)
-
-// PubsubPublishFailed 跨节点 Pub/Sub 发布失败数。
-var PubsubPublishFailed = prometheus.NewCounter(
-	prometheus.CounterOpts{Name: "pubsub_publish_failed_total", Help: "跨节点发布失败数"},
-)
-
 // OutboxPublishError Outbox 发布失败数。
 var OutboxPublishError = prometheus.NewCounter(
 	prometheus.CounterOpts{Name: "outbox_publish_error_total", Help: "Outbox 发布失败数"},
@@ -181,7 +166,7 @@ func New() *prometheus.Registry {
 		WSIngressReceived, PublishFailed, PushDropped, SlowConnectionClosed,
 		KafkaProducerError, KafkaProducerSend,
 		PersistSuccess, PersistRetry, PersistIdempotent, KafkaDLQ,
-		OnlineQueryFailed, PushToConnFailed, PubsubPublishFailed, OutboxPublishError,
+		OutboxPublishError,
 		WSConnectionActive, IDSegmentRemaining, BreakerState, BulkheadQueueLength,
 		OutboxPending, OutboxOldestAge, DependencyDuration,
 	)

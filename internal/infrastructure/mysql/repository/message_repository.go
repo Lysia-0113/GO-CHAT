@@ -184,6 +184,7 @@ func (r *MessageRepository) Persist(ctx context.Context, input message.PersistIn
 			Content:         m.Content,
 			ContentPreview:  m.ContentPreview,
 			CreatedAt:       now,
+			MemberIDs:       input.MemberIDs,
 		})
 		if err != nil {
 			return err

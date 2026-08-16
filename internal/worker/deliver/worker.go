@@ -1,10 +1,13 @@
 // Package deliver 是在线投递 Worker：消费 im.message.persisted，
-// 查询在线路由并推送给持有连接的网关节点（GOCHAT_KAFKA.md §9）。
+// 按事件携带的成员快照推送给本机连接（广播模型，GOCHAT_KAFKA.md §9）。
 //
-// 顺序保证：与 persist Worker 相同的分区串行模型——1 个分发 goroutine
-// 按分区号投递，每分区 1 个处理 goroutine 串行推送。同一会话经
-// conversation_id 哈希进入同一 Kafka 分区，因此同分区串行 = 同会话推送有序，
-// 且提交按 offset 顺序进行，不会出现高 offset 先提交覆盖低 offset 导致的推送丢失。
+// 广播模型：每个节点使用独立的消费者组消费全部分区（组名 = delivery_group + node_id），
+// 每条消息在每个节点都被处理，但只推送本机持有的连接——不需要 Presence 路由、
+// 不需要跨节点 Pub/Sub。离线用户由 after_seq 补偿。
+//
+// 顺序保证：与 persist Worker 相同的分区串行模型——1 个分发 goroutine 按分区号
+// 投递，每分区 1 个处理 goroutine 串行推送。同一会话经 conversation_id 哈希进入
+// 同一 Kafka 分区，因此同分区串行 = 同会话推送有序。
 package deliver
 
 import (
@@ -16,9 +19,7 @@ import (
 
 	"github.com/Lysia-0113/GO-CHAT/internal/connection"
 	"github.com/Lysia-0113/GO-CHAT/internal/infrastructure/kafka"
-	redisinfra "github.com/Lysia-0113/GO-CHAT/internal/infrastructure/redis"
 	"github.com/Lysia-0113/GO-CHAT/internal/message"
-	"github.com/Lysia-0113/GO-CHAT/internal/metrics"
 	"github.com/Lysia-0113/GO-CHAT/internal/svc"
 )
 
@@ -114,7 +115,7 @@ func (w *Worker) Run(appCtx context.Context) error {
 
 // handleWithRetry 串行处理一条消息；基础设施失败时退避重试直到成功或 ctx 取消。
 // 不能跳过失败消息：跳过会导致 offset 被后续消息提交覆盖，在线推送静默丢失。
-// 连接级推送失败（客户端不可达/写队列满）不在此列——那是尽力而为，不阻塞分区。
+// 连接级推送失败不在此列——那是尽力而为（PushToUser 内部计数），不阻塞分区。
 func (w *Worker) handleWithRetry(appCtx context.Context, msg kafka.Message) error {
 	for {
 		if err := w.handle(appCtx, msg); err == nil {
@@ -136,7 +137,7 @@ func (w *Worker) handleWithRetry(appCtx context.Context, msg kafka.Message) erro
 //
 // 错误分类：
 //   - 解析失败：消息已在 MySQL，只丢推送（客户端补拉兜底），提交跳过；
-//   - 基础设施失败（成员查询/在线路由/跨节点发布）：返回错误，整体重试；
+//   - 成员快照缺失（旧事件）时回退查库：查询失败返回错误，整体重试；
 //   - 连接级失败（本机连接不可达/队列满）：尽力而为，只计数不阻塞分区。
 func (w *Worker) handle(ctx context.Context, msg kafka.Message) error {
 	var env kafka.Envelope
@@ -153,20 +154,25 @@ func (w *Worker) handle(ctx context.Context, msg kafka.Message) error {
 		return w.svcCtx.DeliverConsumer.CommitMessages(ctx, msg)
 	}
 
-	// 成员 fanout：发送者收 message.persisted，接收者收 message.new
-	memberIDs, err := w.svcCtx.ConvRepo.ListMemberIDs(ctx, event.ConversationID)
-	if err != nil {
-		return err
+	// 成员列表：优先用事件携带的快照（投递侧零 DB 查询）；旧事件回退查库
+	memberIDs := event.MemberIDs
+	if len(memberIDs) == 0 {
+		var err error
+		memberIDs, err = w.svcCtx.ConvRepo.ListMemberIDs(ctx, event.ConversationID)
+		if err != nil {
+			return err // 基础设施失败：不提交 offset，由 handleWithRetry 重试
+		}
 	}
 
-	// 预取全部成员的在线路由：任一查询失败时尚未推送任何连接，整体重试无重复
-	plans, err := w.planRoutes(ctx, event, memberIDs)
-	if err != nil {
-		return err
-	}
-
-	if err := w.deliver(ctx, event, plans); err != nil {
-		return err
+	// 广播投递：发送者收 message.persisted，接收者收 message.new；
+	// 只推本机连接（本机无该用户连接时 PushToUser 是 O(1) 空操作）
+	for _, memberID := range memberIDs {
+		ev, err := eventForMember(event, memberID)
+		if err != nil {
+			w.svcCtx.Log.Error("build push event failed", "error", err.Error())
+			continue
+		}
+		w.svcCtx.ConnManager.PushToUser(ctx, memberID, ev)
 	}
 
 	// fanout 成功后才标记去重：处理失败重试时不会因 Seen 命中跳过投递；
@@ -174,66 +180,6 @@ func (w *Worker) handle(ctx context.Context, msg kafka.Message) error {
 	w.dedup.Mark(event.MessageID)
 
 	return w.svcCtx.DeliverConsumer.CommitMessages(ctx, msg)
-}
-
-// routePlan 是单个成员在推送前预取的在线路由。
-type routePlan struct {
-	memberID int64
-	routes   []connection.ConnectionRoute
-}
-
-// planRoutes 预取全部成员的在线路由；任一查询失败返回错误。
-// 全部查询成功后才开始推送，避免"半程失败重试"给已推送成员造成重复。
-func (w *Worker) planRoutes(ctx context.Context, event message.MessagePersistedEvent, memberIDs []int64) ([]routePlan, error) {
-	plans := make([]routePlan, 0, len(memberIDs))
-	for _, memberID := range memberIDs {
-		routes, err := w.svcCtx.Presence.OnlineConnections(ctx, memberID)
-		if err != nil {
-			// 在线查询失败是基础设施故障：不提交 offset，由 handleWithRetry 重试
-			metrics.OnlineQueryFailed.Inc()
-			return nil, err
-		}
-		if len(routes) == 0 {
-			continue // 离线：由 after_seq 补偿（GOCHAT_KAFKA.md §9.2）
-		}
-		plans = append(plans, routePlan{memberID: memberID, routes: routes})
-	}
-	return plans, nil
-}
-
-// deliver 按预取路由推送：本机连接直推，跨节点走 Pub/Sub。
-// 本机推送失败（连接不可达/写队列满）尽力而为，由慢连接治理 + 客户端补拉兜底；
-// 跨节点发布失败视为基础设施故障返回错误（整体重试）。
-func (w *Worker) deliver(ctx context.Context, event message.MessagePersistedEvent, plans []routePlan) error {
-	for _, plan := range plans {
-		ev, err := eventForMember(event, plan.memberID)
-		if err != nil {
-			w.svcCtx.Log.Error("build push event failed", "error", err.Error())
-			continue
-		}
-		for _, route := range plan.routes {
-			if route.NodeID == w.svcCtx.ConnManager.NodeID() {
-				// 本机连接直推
-				if err := w.svcCtx.ConnManager.PushToConnection(ctx, route.ConnectionID, ev); err != nil {
-					metrics.PushToConnFailed.Inc()
-				}
-				continue
-			}
-			if w.svcCtx.Pubsub != nil {
-				// 跨节点：发布到目标节点频道（丢失后客户端补拉）；
-				// Data 透传 ev.Data 载荷，避免整包信封再次包装
-				if err := w.svcCtx.Pubsub.PublishToNode(ctx, route.NodeID, redisinfra.DeliveryEvent{
-					EventName:     ev.Event,
-					Data:          ev.Data,
-					ConnectionIDs: []string{route.ConnectionID},
-				}); err != nil {
-					metrics.PubsubPublishFailed.Inc()
-					return err
-				}
-			}
-		}
-	}
-	return nil
 }
 
 // eventForMember 构造成员视角的事件（GOCHAT_API.md §6.5）：

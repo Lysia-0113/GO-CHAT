@@ -78,7 +78,9 @@ type KafkaConfig struct {
 	ProducerTimeout time.Duration `yaml:"producer_timeout"`
 	ProducerAcksAll bool          `yaml:"producer_acks_all"`
 	// Consumer Group 名
-	PersistGroup  string `yaml:"persist_group"`
+	PersistGroup string `yaml:"persist_group"`
+	// DeliveryGroup 是投递组名前缀：广播模型下实际组名 = delivery_group + "-" + node_id，
+	// 每个节点独立组、各自消费全量分区（GOCHAT_KAFKA.md §9 广播投递）
 	DeliveryGroup string `yaml:"delivery_group"`
 	// DLQGroup 死信队列消费组（最小版消费者：仅计数，/metrics 可查）
 	DLQGroup string `yaml:"dlq_group"`
@@ -142,7 +144,6 @@ type ResilienceConfig struct {
 	PersistTxTimeout      time.Duration `yaml:"persist_tx_timeout"`
 	IngressPublishTimeout time.Duration `yaml:"ingress_publish_timeout"`
 	SegmentTimeout        time.Duration `yaml:"segment_timeout"`
-	PubsubTimeout         time.Duration `yaml:"pubsub_timeout"`
 
 	// 限流（GOCHAT_RESILIENCE.md §5.2）
 	SendPerSecond             float64 `yaml:"send_per_second"`
@@ -284,7 +285,6 @@ func defaultConfig() *Config {
 			PersistTxTimeout:      500 * time.Millisecond,
 			IngressPublishTimeout: 300 * time.Millisecond,
 			SegmentTimeout:        100 * time.Millisecond,
-			PubsubTimeout:         100 * time.Millisecond,
 
 			SendPerSecond:             20,
 			SendBurst:                 40,

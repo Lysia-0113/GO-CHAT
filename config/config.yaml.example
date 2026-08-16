@@ -38,7 +38,7 @@ kafka:
   producer_timeout: 3s                # 生产超时（入口侧实际使用 resilience.ingress_publish_timeout）
   producer_acks_all: true             # acks=all + min.insync.replicas 配合
   persist_group: "gochat-message-persist-v1"
-  delivery_group: "gochat-message-delivery-v1"
+  delivery_group: "gochat-message-delivery-v1"  # 广播投递：实际组名 = 该前缀 + "-" + node_id（每节点独立组消费全量）
   dlq_group: "gochat-message-dlq-v1"  # 死信消费组（最小版：仅计数+提交 offset）
   auto_offset_reset: "earliest"       # 新环境 replay 需求：earliest / latest
   max_poll_records: 100
@@ -80,7 +80,6 @@ resilience:
   persist_tx_timeout: 500ms
   ingress_publish_timeout: 300ms
   segment_timeout: 100ms
-  pubsub_timeout: 100ms
 
   # 限流：L2 Redis 令牌桶 + L1 本地兜底
   send_per_second: 20                 # 单用户发送 20 条/秒
