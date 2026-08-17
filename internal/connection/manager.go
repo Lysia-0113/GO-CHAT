@@ -58,16 +58,14 @@ func (m *Manager) Register(ctx context.Context, conn Connection) error {
 	m.active.Add(1)
 
 	if m.presence != nil {
-		if err := m.presence.Register(ctx, ConnectionRoute{
+		// 连接已在本机 map 注册，Presence 仅是为未来的在线状态功能维护的副本：
+		// 广播模型下投递链路不查询 Presence，写入失败不影响连接可用性与在线投递
+		_ = m.presence.Register(ctx, ConnectionRoute{
 			ConnectionID: conn.ID(),
 			UserID:       conn.UserID(),
 			DeviceID:     conn.DeviceID(),
 			NodeID:       m.nodeID,
-		}); err != nil {
-			// Presence 写入失败不影响本机连接工作；心跳续期会重试
-			m.conns[conn.ID()] = conn // 保持已注册
-			return nil
-		}
+		})
 	}
 	return nil
 }

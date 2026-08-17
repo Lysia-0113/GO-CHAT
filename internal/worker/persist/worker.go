@@ -28,7 +28,6 @@ const partChannelSize = 128
 // Worker 持久化 Worker。依赖经 svcCtx 服务定位器取用（GOCHAT_API.md §11.3）。
 type Worker struct {
 	svcCtx        *svc.ServiceContext
-	publisher     message.MessagePublisher // 本 Worker 专用的 persisted 发布器
 	maxRetries    int
 	backoff       time.Duration
 	txTimeout     time.Duration
@@ -50,7 +49,6 @@ func New(svcCtx *svc.ServiceContext, cfg Config) *Worker {
 	}
 	return &Worker{
 		svcCtx:        svcCtx,
-		publisher:     kafkainfra.NewPublisher(svcCtx.Kafka, "persist-worker"),
 		maxRetries:    cfg.MaxRetries,
 		backoff:       cfg.Backoff,
 		txTimeout:     cfg.TxTimeout,
@@ -177,15 +175,15 @@ func (w *Worker) handle(appCtx context.Context, msg kafkainfra.Message) (bool, e
 		return false, err
 	}
 
-	// 2. 幂等检查：已存在则复用原结果并重新发布 persisted（GOCHAT_DATABASE.md §10）
+	// 2. 幂等检查：已存在则只推进 Offset（单写者原则，GOCHAT_DATABASE.md §10）。
+	//    不在此补发 persisted：消息落库时已与 outbox 行同事务提交，persisted 事件
+	//    只由 Outbox Publisher 发布；此处补发会在 commit 失败重试时反复发布同一
+	//    message_id，成为重复投递源（outbox 死行恢复见后续迭代）。
 	existing, err := w.svcCtx.MsgRepo.FindByClientMessageID(appCtx, ingress.SenderID, ingress.ClientMessageID)
 	if err != nil {
 		return false, err
 	}
 	if existing != nil {
-		if err := w.publisher.PublishPersisted(appCtx, toPersistedEvent(existing, memberIDs)); err != nil {
-			return false, err
-		}
 		metrics.PersistIdempotent.Inc()
 		if err := w.svcCtx.PersistConsumer.CommitMessages(appCtx, msg); err != nil {
 			return false, err
@@ -279,7 +277,12 @@ func (w *Worker) dlqAndCommit(ctx context.Context, msg kafkainfra.Message, env k
 	}
 	if err := w.svcCtx.Kafka.PublishDLQ(ctx, dlqEnv); err != nil {
 		w.svcCtx.Log.Error("dlq publish failed", "error", err.Error())
+		// 不提交原 offset：DLQ 发布失败时，消息既未落库也未进死信，
+		// 提交会让它无痕丢失。由 handleWithRetry 原地重试，直到 DLQ 发布成功
+		// （宁可卡住分区，不可丢，与 persist 重试语义一致）。
+		return false, err
 	}
+	// 发布成功后才计数：与 DLQ 消费侧计数对齐，避免把失败的发布尝试计为多份
 	metrics.KafkaDLQ.WithLabelValues(msg.Topic, code).Inc()
 	if err := w.svcCtx.PersistConsumer.CommitMessages(ctx, msg); err != nil {
 		return false, err
@@ -322,20 +325,4 @@ func parseConvID(s string) int64 {
 		v = v*10 + int64(r-'0')
 	}
 	return v
-}
-
-// toPersistedEvent 把已持久化消息转换为 persisted 事件。
-func toPersistedEvent(m *message.Message, memberIDs []int64) message.MessagePersistedEvent {
-	return message.MessagePersistedEvent{
-		MessageID:       m.MessageID,
-		Seq:             m.Seq,
-		SenderID:        m.SenderID,
-		ClientMessageID: m.ClientMessageID,
-		ConversationID:  m.ConversationID,
-		MessageType:     m.MessageType,
-		Content:         m.Content,
-		ContentPreview:  m.ContentPreview,
-		CreatedAt:       m.CreatedAt,
-		MemberIDs:       memberIDs,
-	}
 }
