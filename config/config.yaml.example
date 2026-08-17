@@ -49,6 +49,7 @@ kafka:
   outbox_backoff: 2s
   outbox_poll_interval: 500ms
   outbox_batch_size: 100
+  outbox_claim_lease: 5s               # 领取租约：Claim 后该时长内其他 Publisher 不可见（须 > producer_timeout）
 
 auth:
   jwt_secret: "change-me-in-production"  # 生产必须用环境变量 GOChat_AUTH_JWT_SECRET 注入

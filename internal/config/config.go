@@ -97,6 +97,9 @@ type KafkaConfig struct {
 	OutboxBackoff      time.Duration `yaml:"outbox_backoff"`
 	OutboxPollInterval time.Duration `yaml:"outbox_poll_interval"`
 	OutboxBatchSize    int           `yaml:"outbox_batch_size"`
+	// OutboxClaimLease 领取租约：Claim 后行在该时长内对其他 Publisher 不可见。
+	// 必须大于 ProducerTimeout（默认 3s），否则慢发布期间行会被再次领取并重复发布。
+	OutboxClaimLease time.Duration `yaml:"outbox_claim_lease"`
 }
 
 type AuthConfig struct {
@@ -255,6 +258,7 @@ func defaultConfig() *Config {
 			OutboxBackoff:      2 * time.Second,
 			OutboxPollInterval: 500 * time.Millisecond,
 			OutboxBatchSize:    100,
+			OutboxClaimLease:   5 * time.Second,
 		},
 		Auth: AuthConfig{
 			JWTSecret:      "change-me-in-production",

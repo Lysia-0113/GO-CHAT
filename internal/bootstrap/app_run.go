@@ -47,6 +47,7 @@ func (a *App) Run(appCtx context.Context) error {
 		PollInterval: a.svcCtx.Config.Kafka.OutboxPollInterval,
 		BatchSize:    a.svcCtx.Config.Kafka.OutboxBatchSize,
 		InstanceID:   a.svcCtx.Config.Server.NodeID,
+		ClaimLease:   a.svcCtx.Config.Kafka.OutboxClaimLease,
 	})
 	deliverWorker := deliver.New(a.svcCtx, deliver.Config{
 		NumPartitions: a.svcCtx.Config.Kafka.NumPartitions,

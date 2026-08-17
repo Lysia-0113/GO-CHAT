@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math/rand"
 	"time"
 
@@ -22,6 +23,9 @@ type OutboxRecord struct {
 
 // OutboxRepository 负责 Outbox 领取、发布成功/失败状态推进
 // （GOCHAT_DATABASE.md §9.3 / GOCHAT_KAFKA.md §8）。
+// 领取采用"短事务标记 + 发布租约"：Claim 事务只标记所有权并立即提交，
+// 同时把 next_retry_at 推到 now+lease，租约期内行对其他 Publisher 不可见；
+// 状态推进（MarkPublished/MarkFailed）以 locked_by 校验持有者身份。
 type OutboxRepository struct {
 	db *gorm.DB
 }
@@ -32,7 +36,11 @@ func NewOutboxRepository(db *gorm.DB) *OutboxRepository {
 
 // Claim 领取一批到期待投递任务：SELECT ... FOR UPDATE SKIP LOCKED 后
 // 立即写入 locked_by/locked_at 并提交领取事务；实际 Kafka 发布在事务外执行。
-func (r *OutboxRepository) Claim(ctx context.Context, batchSize int, instanceID string) ([]OutboxRecord, error) {
+// lease 是发布租约：领取时把 next_retry_at 推到 now+lease，该行在租约期内对
+// 其他 Publisher 不可见（避免同一事件被重复发布）；Publisher 崩溃时租约过期后
+// 行自动重新可领（崩溃恢复）。lease 必须大于 Kafka 发布超时（ProducerTimeout），
+// 否则慢发布期间行会被再次领取并重复发布。
+func (r *OutboxRepository) Claim(ctx context.Context, batchSize int, instanceID string, lease time.Duration) ([]OutboxRecord, error) {
 	var records []OutboxRecord
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var rows []model.MessageOutbox
@@ -72,6 +80,10 @@ func (r *OutboxRepository) Claim(ctx context.Context, batchSize int, instanceID 
 					"status":    model.OutboxRetrying,
 					"locked_by": instanceID,
 					"locked_at": now,
+					// 租约：下次可被领取的时间 = 领取时间 + 发布租约。
+					// 没有这一行，行在发布期间对其他 Publisher 仍满足
+					// `next_retry_at <= now`，会被重复领取并重复发布。
+					"next_retry_at": now.Add(lease),
 				}).Error; err != nil {
 				return err
 			}
@@ -90,32 +102,42 @@ func (r *OutboxRepository) Claim(ctx context.Context, batchSize int, instanceID 
 }
 
 // MarkPublished 发布成功后更新状态。
-func (r *OutboxRepository) MarkPublished(ctx context.Context, messageID int64, eventType int8) error {
-	err := r.db.WithContext(ctx).Model(&model.MessageOutbox{}).
-		Where("message_id = ? AND event_type = ?", messageID, eventType).
+// lockedBy 是领取时的实例标识（fencing token）：租约过期后行可能已被其他
+// Publisher 重新领取，此时原持有者的更新必须失效，防止过期持有者覆盖新状态。
+// 返回 applied=false 表示该行当前不属于 lockedBy（所有权已转移），调用方无需处理。
+func (r *OutboxRepository) MarkPublished(ctx context.Context, messageID int64, eventType int8, lockedBy string) (bool, error) {
+	res := r.db.WithContext(ctx).Model(&model.MessageOutbox{}).
+		Where("message_id = ? AND event_type = ? AND locked_by = ?", messageID, eventType, lockedBy).
 		Updates(map[string]interface{}{
 			"status":       model.OutboxPublished,
 			"published_at": time.Now().UTC(),
 			"locked_by":    nil,
 			"locked_at":    nil,
 			"last_error":   "",
-		}).Error
-	if err != nil {
-		return errs.Internal(err)
+		})
+	if res.Error != nil {
+		return false, errs.Internal(res.Error)
 	}
-	return nil
+	return res.RowsAffected > 0, nil
 }
 
 // MarkFailed 发布失败：重试次数 +1；超过上限进入死信（GOCHAT_DATABASE.md §9.3）。
-func (r *OutboxRepository) MarkFailed(ctx context.Context, messageID int64, eventType int8, errMsg string, maxRetries int, backoff time.Duration) error {
+// lockedBy 校验同 MarkPublished（fencing token）：所有权已转移时 no-op，
+// 防止过期持有者把已被重新领取的行打回重试、或破坏新持有者的重试计划。
+// 返回 applied=false 表示该行当前不属于 lockedBy，调用方无需处理。
+func (r *OutboxRepository) MarkFailed(ctx context.Context, messageID int64, eventType int8, errMsg string, maxRetries int, backoff time.Duration, lockedBy string) (bool, error) {
 	now := time.Now().UTC()
 
 	// 读取当前重试次数，计算指数退避 + 随机抖动（GOCHAT_RESILIENCE.md §10.2）
+	// 仅当行仍归自己所有时才推进；所有权已转移（租约过期被重新领取）则 no-op。
 	var cur model.MessageOutbox
 	if err := r.db.WithContext(ctx).
-		Where("message_id = ? AND event_type = ?", messageID, eventType).
+		Where("message_id = ? AND event_type = ? AND locked_by = ?", messageID, eventType, lockedBy).
 		Select("retry_count").Take(&cur).Error; err != nil {
-		return errs.Internal(err)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return false, nil
+		}
+		return false, errs.Internal(err)
 	}
 	nextRetries := cur.RetryCount + 1
 	delay := backoff * time.Duration(1<<minInt(nextRetries, 6))
@@ -129,8 +151,8 @@ func (r *OutboxRepository) MarkFailed(ctx context.Context, messageID int64, even
 		nextRetryAt = now
 	}
 
-	err := r.db.WithContext(ctx).Model(&model.MessageOutbox{}).
-		Where("message_id = ? AND event_type = ?", messageID, eventType).
+	res := r.db.WithContext(ctx).Model(&model.MessageOutbox{}).
+		Where("message_id = ? AND event_type = ? AND locked_by = ?", messageID, eventType, lockedBy).
 		Updates(map[string]interface{}{
 			"status":        newStatus,
 			"retry_count":   nextRetries,
@@ -138,11 +160,11 @@ func (r *OutboxRepository) MarkFailed(ctx context.Context, messageID int64, even
 			"last_error":    truncateErr(errMsg),
 			"locked_by":     nil,
 			"locked_at":     nil,
-		}).Error
-	if err != nil {
-		return errs.Internal(err)
+		})
+	if res.Error != nil {
+		return false, errs.Internal(res.Error)
 	}
-	return nil
+	return res.RowsAffected > 0, nil
 }
 
 func minInt(a, b int) int {
