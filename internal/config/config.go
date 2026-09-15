@@ -97,6 +97,11 @@ type KafkaConfig struct {
 	OutboxBackoff      time.Duration `yaml:"outbox_backoff"`
 	OutboxPollInterval time.Duration `yaml:"outbox_poll_interval"`
 	OutboxBatchSize    int           `yaml:"outbox_batch_size"`
+	// OutboxWorkerCount 是集群内全局 worker slot 数，各实例必须一致；
+	// slot 通过 MySQL GET_LOCK 唯一分配，并映射到固定的会话分片。
+	OutboxWorkerCount int `yaml:"outbox_worker_count"`
+	// OutboxPublishConcurrency 是每个全局 slot 内不同会话的最大并发数。
+	OutboxPublishConcurrency int `yaml:"outbox_publish_concurrency"`
 	// OutboxClaimLease 领取租约：Claim 后行在该时长内对其他 Publisher 不可见。
 	// 必须大于 ProducerTimeout（默认 3s），否则慢发布期间行会被再次领取并重复发布。
 	OutboxClaimLease time.Duration `yaml:"outbox_claim_lease"`
@@ -243,22 +248,24 @@ func defaultConfig() *Config {
 			WriteTimeout: 500 * time.Millisecond,
 		},
 		Kafka: KafkaConfig{
-			Brokers:            []string{"127.0.0.1:9092"},
-			ProducerTimeout:    3 * time.Second,
-			ProducerAcksAll:    true,
-			PersistGroup:       "gochat-message-persist-v1",
-			DeliveryGroup:      "gochat-message-delivery-v1",
-			DLQGroup:           "gochat-message-dlq-v1",
-			AutoOffsetReset:    "earliest",
-			MaxPollRecords:     100,
-			PersistMaxRetries:  5,
-			PersistBackoff:     200 * time.Millisecond,
-			NumPartitions:      3,
-			OutboxMaxRetries:   10,
-			OutboxBackoff:      2 * time.Second,
-			OutboxPollInterval: 500 * time.Millisecond,
-			OutboxBatchSize:    100,
-			OutboxClaimLease:   5 * time.Second,
+			Brokers:                  []string{"127.0.0.1:9092"},
+			ProducerTimeout:          3 * time.Second,
+			ProducerAcksAll:          true,
+			PersistGroup:             "gochat-message-persist-v1",
+			DeliveryGroup:            "gochat-message-delivery-v1",
+			DLQGroup:                 "gochat-message-dlq-v1",
+			AutoOffsetReset:          "earliest",
+			MaxPollRecords:           100,
+			PersistMaxRetries:        5,
+			PersistBackoff:           200 * time.Millisecond,
+			NumPartitions:            3,
+			OutboxMaxRetries:         10,
+			OutboxBackoff:            2 * time.Second,
+			OutboxPollInterval:       500 * time.Millisecond,
+			OutboxBatchSize:          100,
+			OutboxWorkerCount:        4,
+			OutboxPublishConcurrency: 8,
+			OutboxClaimLease:         5 * time.Second,
 		},
 		Auth: AuthConfig{
 			JWTSecret:      "change-me-in-production",
@@ -332,6 +339,8 @@ func applyEnvOverrides(cfg *Config) {
 	setStr("GOChat_AUTH_JWT_SECRET", &cfg.Auth.JWTSecret)
 	setInt("GOChat_REDIS_DB", &cfg.Redis.DB)
 	setInt("GOChat_SERVER_WS_WRITE_QUEUE_SIZE", &cfg.Server.WSWriteQueueSize)
+	setInt("GOChat_KAFKA_OUTBOX_WORKER_COUNT", &cfg.Kafka.OutboxWorkerCount)
+	setInt("GOChat_KAFKA_OUTBOX_PUBLISH_CONCURRENCY", &cfg.Kafka.OutboxPublishConcurrency)
 	setStr("GOChat_KAFKA_BROKERS", &kafkaBrokersEnv) // 逗号分隔，最后统一处理
 }
 

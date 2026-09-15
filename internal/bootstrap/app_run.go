@@ -15,6 +15,7 @@ import (
 	kafkago "github.com/segmentio/kafka-go"
 
 	"github.com/Lysia-0113/GO-CHAT/internal/infrastructure/idgen/segment"
+	"github.com/Lysia-0113/GO-CHAT/internal/message"
 	"github.com/Lysia-0113/GO-CHAT/internal/metrics"
 	"github.com/Lysia-0113/GO-CHAT/internal/svc"
 	httptransport "github.com/Lysia-0113/GO-CHAT/internal/transport/http"
@@ -35,6 +36,18 @@ type App struct {
 // Run 启动 HTTP 服务与全部 Worker，阻塞直到 ctx 取消后优雅退出。
 func (a *App) Run(appCtx context.Context) error {
 	// ---- Worker 启动 ----
+	outboxWorkerCount := a.svcCtx.Config.Kafka.OutboxWorkerCount
+	localOutboxWorkers := a.svcCtx.Config.Resilience.OutboxWorkers
+	if outboxWorkerCount <= 0 || outboxWorkerCount > message.OutboxShardCount {
+		return fmt.Errorf("kafka.outbox_worker_count must be between 1 and %d", message.OutboxShardCount)
+	}
+	if localOutboxWorkers <= 0 {
+		return errors.New("resilience.outbox_workers must be greater than 0")
+	}
+	if localOutboxWorkers > outboxWorkerCount {
+		localOutboxWorkers = outboxWorkerCount
+	}
+
 	persistWorker := persist.New(a.svcCtx, persist.Config{
 		MaxRetries:    a.svcCtx.Config.Kafka.PersistMaxRetries,
 		Backoff:       a.svcCtx.Config.Kafka.PersistBackoff,
@@ -42,12 +55,13 @@ func (a *App) Run(appCtx context.Context) error {
 		NumPartitions: a.svcCtx.Config.Kafka.NumPartitions,
 	})
 	outboxPublisher := outbox.New(a.svcCtx, outbox.Config{
-		MaxRetries:   a.svcCtx.Config.Kafka.OutboxMaxRetries,
-		Backoff:      a.svcCtx.Config.Kafka.OutboxBackoff,
-		PollInterval: a.svcCtx.Config.Kafka.OutboxPollInterval,
-		BatchSize:    a.svcCtx.Config.Kafka.OutboxBatchSize,
-		InstanceID:   a.svcCtx.Config.Server.NodeID,
-		ClaimLease:   a.svcCtx.Config.Kafka.OutboxClaimLease,
+		MaxRetries:         a.svcCtx.Config.Kafka.OutboxMaxRetries,
+		Backoff:            a.svcCtx.Config.Kafka.OutboxBackoff,
+		PollInterval:       a.svcCtx.Config.Kafka.OutboxPollInterval,
+		BatchSize:          a.svcCtx.Config.Kafka.OutboxBatchSize,
+		WorkerCount:        outboxWorkerCount,
+		PublishConcurrency: a.svcCtx.Config.Kafka.OutboxPublishConcurrency,
+		ClaimLease:         a.svcCtx.Config.Kafka.OutboxClaimLease,
 	})
 	deliverWorker := deliver.New(a.svcCtx, deliver.Config{
 		NumPartitions: a.svcCtx.Config.Kafka.NumPartitions,
@@ -72,7 +86,7 @@ func (a *App) Run(appCtx context.Context) error {
 			a.svcCtx.Log.Error("deliver worker exited", "error", err.Error())
 		}
 	}()
-	for i := 0; i < a.svcCtx.Config.Resilience.OutboxWorkers; i++ {
+	for i := 0; i < localOutboxWorkers; i++ {
 		go func() {
 			if err := outboxPublisher.Run(appCtx); err != nil {
 				a.svcCtx.Log.Error("outbox publisher exited", "error", err.Error())

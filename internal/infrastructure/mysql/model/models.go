@@ -92,6 +92,7 @@ func (IDGenerator) TableName() string { return "id_generator" }
 type MessageOutbox struct {
 	MessageID   int64      `gorm:"column:message_id;primaryKey"`
 	EventType   int8       `gorm:"column:event_type;primaryKey"`
+	ShardID     int        `gorm:"column:shard_id"`
 	Payload     string     `gorm:"column:payload;type:json"`
 	Status      int8       `gorm:"column:status"`
 	RetryCount  int        `gorm:"column:retry_count"`
@@ -111,7 +112,9 @@ const (
 	OutboxPending   int8 = 0
 	OutboxPublished int8 = 1
 	OutboxRetrying  int8 = 2
-	OutboxDead      int8 = 3
+	OutboxDead      int8 = 3 // DLQ 写入成功后的终态，可放行后续 seq。
+	// OutboxDLQPending remains the conversation head until its DLQ write succeeds.
+	OutboxDLQPending int8 = 4
 )
 
 // Outbox 事件类型。

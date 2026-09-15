@@ -13,13 +13,16 @@ package deliver
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/Lysia-0113/GO-CHAT/internal/connection"
 	"github.com/Lysia-0113/GO-CHAT/internal/infrastructure/kafka"
 	"github.com/Lysia-0113/GO-CHAT/internal/message"
+	"github.com/Lysia-0113/GO-CHAT/internal/metrics"
 	"github.com/Lysia-0113/GO-CHAT/internal/svc"
 )
 
@@ -31,6 +34,8 @@ type Worker struct {
 	svcCtx        *svc.ServiceContext
 	dedup         *dedupe
 	numPartitions int
+	commitMessage func(context.Context, kafka.Message) error
+	publishDLQ    func(context.Context, kafka.Envelope) error
 }
 
 // Config 是 Worker 配置。
@@ -43,11 +48,16 @@ func New(svcCtx *svc.ServiceContext, cfg Config) *Worker {
 	if cfg.NumPartitions <= 0 {
 		cfg.NumPartitions = 3
 	}
-	return &Worker{
+	worker := &Worker{
 		svcCtx:        svcCtx,
 		dedup:         newDedupe(5 * time.Minute),
 		numPartitions: cfg.NumPartitions,
 	}
+	worker.commitMessage = func(ctx context.Context, msg kafka.Message) error {
+		return svcCtx.DeliverConsumer.CommitMessages(ctx, msg)
+	}
+	worker.publishDLQ = svcCtx.Kafka.PublishDLQ
+	return worker
 }
 
 // Run 消费 im.message.persisted 直至 ctx 取消。
@@ -113,9 +123,8 @@ func (w *Worker) Run(appCtx context.Context) error {
 	return nil
 }
 
-// handleWithRetry 串行处理一条消息；基础设施失败时退避重试直到成功或 ctx 取消。
-// 不能跳过失败消息：跳过会导致 offset 被后续消息提交覆盖，在线推送静默丢失。
-// 连接级推送失败不在此列——那是尽力而为（PushToUser 内部计数），不阻塞分区。
+// handleWithRetry 串行处理一条消息；基础设施失败（包括 DLQ 写入失败）时
+// 退避重试直到成功或 ctx 取消。推送失败只有在 DLQ 确认成功后才算已处理并提交 offset。
 func (w *Worker) handleWithRetry(appCtx context.Context, msg kafka.Message) error {
 	for {
 		if err := w.handle(appCtx, msg); err == nil {
@@ -138,20 +147,20 @@ func (w *Worker) handleWithRetry(appCtx context.Context, msg kafka.Message) erro
 // 错误分类：
 //   - 解析失败：消息已在 MySQL，只丢推送（客户端补拉兜底），提交跳过；
 //   - 成员快照缺失（旧事件）时回退查库：查询失败返回错误，整体重试；
-//   - 连接级失败（本机连接不可达/队列满）：尽力而为，只计数不阻塞分区。
+//   - 连接级推送失败：先写 DLQ，成功后标记去重并提交 offset，避免卡住分区。
 func (w *Worker) handle(ctx context.Context, msg kafka.Message) error {
 	var env kafka.Envelope
 	if err := json.Unmarshal(msg.Value, &env); err != nil {
-		return w.svcCtx.DeliverConsumer.CommitMessages(ctx, msg)
+		return w.commitMessage(ctx, msg)
 	}
 	var event message.MessagePersistedEvent
 	if err := json.Unmarshal(env.Data, &event); err != nil {
-		return w.svcCtx.DeliverConsumer.CommitMessages(ctx, msg)
+		return w.commitMessage(ctx, msg)
 	}
 
 	// 按 message_id 短期幂等（Outbox 可能重复投递）
 	if w.dedup.Seen(event.MessageID) {
-		return w.svcCtx.DeliverConsumer.CommitMessages(ctx, msg)
+		return w.commitMessage(ctx, msg)
 	}
 
 	// 成员列表：优先用事件携带的快照（投递侧零 DB 查询）；旧事件回退查库
@@ -166,20 +175,70 @@ func (w *Worker) handle(ctx context.Context, msg kafka.Message) error {
 
 	// 广播投递：发送者收 message.persisted，接收者收 message.new；
 	// 只推本机连接（本机无该用户连接时 PushToUser 是 O(1) 空操作）
+	var pushFailures []connection.PushFailure
 	for _, memberID := range memberIDs {
 		ev, err := eventForMember(event, memberID)
 		if err != nil {
 			w.svcCtx.Log.Error("build push event failed", "error", err.Error())
+			pushFailures = append(pushFailures, connection.PushFailure{UserID: memberID, Reason: err.Error()})
 			continue
 		}
-		w.svcCtx.ConnManager.PushToUser(ctx, memberID, ev)
+		_, failures := w.svcCtx.ConnManager.PushToUserWithFailures(ctx, memberID, ev)
+		pushFailures = append(pushFailures, failures...)
+	}
+	if len(pushFailures) != 0 {
+		if err := w.pushFailuresToDLQ(ctx, msg, event, pushFailures); err != nil {
+			return err // DLQ 未写入：不提交 offset，重试当前消息
+		}
 	}
 
 	// fanout 成功后才标记去重：处理失败重试时不会因 Seen 命中跳过投递；
 	// 提交失败重试时直接命中 Seen，只补提交、不重复推送
 	w.dedup.Mark(event.MessageID)
 
-	return w.svcCtx.DeliverConsumer.CommitMessages(ctx, msg)
+	return w.commitMessage(ctx, msg)
+}
+
+func (w *Worker) pushFailuresToDLQ(ctx context.Context, msg kafka.Message, event message.MessagePersistedEvent, failures []connection.PushFailure) error {
+	payload := kafka.DLQPayload{
+		FailedTopic:     msg.Topic,
+		FailedPartition: msg.Partition,
+		FailedOffset:    msg.Offset,
+		RetryCount:      0,
+		ErrorCode:       "WEBSOCKET_PUSH_FAILED",
+		ErrorMessage:    pushFailureDescription(failures),
+		FailedAt:        time.Now().UTC(),
+		OriginalEvent:   json.RawMessage(append([]byte(nil), msg.Value...)),
+	}
+	env, err := kafka.NewEnvelope(kafka.EventDLQ, "deliver-worker", event.ConversationID, payload)
+	if err != nil {
+		return err
+	}
+	if err := w.publishDLQ(ctx, env); err != nil {
+		w.svcCtx.Log.Error("deliver dlq publish failed", "topic", msg.Topic, "partition", msg.Partition, "offset", msg.Offset, "error", err.Error())
+		return err
+	}
+	metrics.KafkaDLQ.WithLabelValues(msg.Topic, payload.ErrorCode).Inc()
+	return nil
+}
+
+func pushFailureDescription(failures []connection.PushFailure) string {
+	parts := make([]string, 0, len(failures))
+	for _, failure := range failures {
+		part := fmt.Sprintf("user_id=%d", failure.UserID)
+		if failure.ConnectionID != "" {
+			part += " connection_id=" + failure.ConnectionID
+		}
+		if failure.Reason != "" {
+			part += " reason=" + strings.ReplaceAll(failure.Reason, "\n", " ")
+		}
+		parts = append(parts, part)
+	}
+	description := fmt.Sprintf("%d websocket push failure(s): %s", len(failures), strings.Join(parts, "; "))
+	if len(description) > 1024 {
+		return description[:1024]
+	}
+	return description
 }
 
 // eventForMember 构造成员视角的事件（GOCHAT_API.md §6.5）：

@@ -23,6 +23,8 @@ kafka:
   max_poll_records: 20
   num_partitions: 3                   # ingress/persisted 分区数（persist/deliver worker 按分区路由）
   outbox_batch_size: 20
+  outbox_worker_count: 1              # 集群全局 slot 数；多实例部署时所有实例设为同一值
+  outbox_publish_concurrency: 4       # 每个 slot 同时发布的不同会话数上限
 
 auth:
   # 2 核机器避免 Argon2 为单次哈希创建过多工作线程；保留 64MiB

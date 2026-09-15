@@ -24,6 +24,13 @@ type Connection interface {
 	Closed() bool
 }
 
+// PushFailure 描述一条连接级投递失败；由 Deliver Worker 汇总写入 DLQ。
+type PushFailure struct {
+	UserID       int64
+	ConnectionID string
+	Reason       string
+}
+
 // Manager 是进程内 ConnectionManager（V1 单节点实现，GOCHAT_API.md §13.1）。
 type Manager struct {
 	nodeID   string
@@ -104,6 +111,13 @@ func (m *Manager) PushToConnection(ctx context.Context, connectionID string, eve
 // PushToUser 向用户全部在线连接推送事件；推送失败不阻塞其他连接。
 // 返回实际送达的连接数。
 func (m *Manager) PushToUser(ctx context.Context, userID int64, event Event) int {
+	delivered, _ := m.PushToUserWithFailures(ctx, userID, event)
+	return delivered
+}
+
+// PushToUserWithFailures 向用户全部在线连接推送事件，并返回失败连接明细。
+// 本机没有连接是正常情况，不会被视为推送失败。
+func (m *Manager) PushToUserWithFailures(ctx context.Context, userID int64, event Event) (int, []PushFailure) {
 	m.mu.RLock()
 	conns := make([]Connection, 0, len(m.byUser[userID]))
 	for id := range m.byUser[userID] {
@@ -114,15 +128,17 @@ func (m *Manager) PushToUser(ctx context.Context, userID int64, event Event) int
 	m.mu.RUnlock()
 
 	delivered := 0
+	var failures []PushFailure
 	for _, c := range conns {
 		if err := c.Push(ctx, event); err == nil {
 			delivered++
 		} else {
 			// 队列满/连接关闭：按事件类型分桶计数（GOCHAT_RESILIENCE.md §11.1）
 			metrics.PushDropped.WithLabelValues(event.Event).Inc()
+			failures = append(failures, PushFailure{UserID: userID, ConnectionID: c.ID(), Reason: err.Error()})
 		}
 	}
-	return delivered
+	return delivered, failures
 }
 
 // Count 返回当前在线连接数。

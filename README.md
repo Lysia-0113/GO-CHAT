@@ -134,7 +134,7 @@ internal/
     ├── persist/       # Kafka → MySQL 持久化
     ├── outbox/        # Outbox → persisted Topic
     └── deliver/       # persisted → 缓存 + 在线投递
-migrations/            # 6 张表的版本化 SQL
+migrations/            # 数据表与 Outbox 分片的版本化 SQL
 config/                # 配置示例
 ```
 
@@ -143,7 +143,9 @@ config/                # 配置示例
 - **消息状态**：`sending → accepted → persisted → delivered → read`（Kafka 异步持久化，accepted 不代表落库）
 - **幂等**：Redis SET NX 快速拦截（nonce 条件更新）+ `uk_messages_sender_client (sender_id, client_msg_id)` 最终兜底
 - **同会话有序**：Kafka Key = conversation_id；持久化事务 `SELECT last_seq FOR UPDATE` 串行分配 seq
-- **可靠事件**：messages 与 message_outbox 同事务提交；Outbox Publisher 用 `FOR UPDATE SKIP LOCKED` 多实例领取，失败退避重试，超限进死信
+- **Outbox 有序并行**：conversation_id CRC32 映射到固定分片，每个全局 worker slot 由 MySQL `GET_LOCK` 唯一占用；同会话只发布最早未完成 seq，不同会话有界并行。Outbox 重试耗尽后必须先写 DLQ，成功后该 seq 才算终态并放行后续消息。
+- **在线推送失败**：Deliver 将连接级推送失败写入 DLQ，DLQ 确认成功后提交原 persisted offset；DLQ 发布失败时原 offset 保持未提交。
+- **可靠事件**：messages 与 message_outbox 同事务提交；Outbox Publisher 按会话队头领取，失败退避重试，超限写入 DLQ
 - **ID 生成**：MySQL 号段 + version CAS + 双 Buffer 预加载；message_id 在持久化消费者内分配
 - **降级矩阵**：Redis 缓存失败回源 MySQL；Kafka ingress 不可用快速失败（不假成功）；在线投递失败由 after_seq 补偿
 

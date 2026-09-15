@@ -4,7 +4,7 @@ CREATE TABLE IF NOT EXISTS message_outbox (
     message_id       BIGINT       NOT NULL COMMENT '对应 messages.id',
     event_type       TINYINT      NOT NULL COMMENT '1 message_persisted',
     payload          JSON         NOT NULL COMMENT '完整不可变事件载荷',
-    status           TINYINT      NOT NULL DEFAULT 0 COMMENT '0 待投递，1 已投递，2 重试中，3 死信',
+    status           TINYINT      NOT NULL DEFAULT 0 COMMENT '0 待投递，1 已投递，2 重试中，3 DLQ 已写入，4 等待写入 DLQ',
     retry_count      INT          NOT NULL DEFAULT 0,
     next_retry_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     locked_by        VARCHAR(64)  NULL COMMENT 'Publisher 实例标识',

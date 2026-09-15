@@ -192,6 +192,7 @@ func (r *MessageRepository) Persist(ctx context.Context, input message.PersistIn
 		outbox := &model.MessageOutbox{
 			MessageID:   m.MessageID,
 			EventType:   model.OutboxEventPersisted,
+			ShardID:     message.OutboxShardID(m.ConversationID),
 			Payload:     string(payload),
 			Status:      model.OutboxPending,
 			NextRetryAt: now,

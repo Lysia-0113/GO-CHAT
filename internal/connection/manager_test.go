@@ -3,6 +3,7 @@ package connection
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 )
 
@@ -13,14 +14,36 @@ type fakeConn struct {
 	device string
 	events []Event
 	closed bool
+	err    error
 }
 
 func (f *fakeConn) ID() string       { return f.id }
 func (f *fakeConn) UserID() int64    { return f.userID }
 func (f *fakeConn) DeviceID() string { return f.device }
 func (f *fakeConn) Push(ctx context.Context, e Event) error {
+	if f.err != nil {
+		return f.err
+	}
 	f.events = append(f.events, e)
 	return nil
+}
+
+func TestManagerPushToUserReturnsFailures(t *testing.T) {
+	m := NewManager("node-1", nil)
+	ok := &fakeConn{id: "conn-ok", userID: 10}
+	failed := &fakeConn{id: "conn-full", userID: 10, err: errors.New("queue full")}
+	for _, conn := range []*fakeConn{ok, failed} {
+		if err := m.Register(context.Background(), conn); err != nil {
+			t.Fatal(err)
+		}
+	}
+	delivered, failures := m.PushToUserWithFailures(context.Background(), 10, Event{Event: EventMessageNew})
+	if delivered != 1 {
+		t.Fatalf("expected 1 delivered connection, got %d", delivered)
+	}
+	if len(failures) != 1 || failures[0].UserID != 10 || failures[0].ConnectionID != "conn-full" || failures[0].Reason != "queue full" {
+		t.Fatalf("unexpected failures: %+v", failures)
+	}
 }
 func (f *fakeConn) Close(reason string) { f.closed = true }
 func (f *fakeConn) Closed() bool        { return f.closed }

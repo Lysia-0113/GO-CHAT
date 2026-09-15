@@ -49,6 +49,8 @@ kafka:
   outbox_backoff: 2s
   outbox_poll_interval: 500ms
   outbox_batch_size: 100
+  outbox_worker_count: 4                # 集群全局 worker slot 数；所有实例必须一致，由 MySQL GET_LOCK 自动唯一分配
+  outbox_publish_concurrency: 8         # 每个 slot 同时发布的不同会话数上限
   outbox_claim_lease: 5s               # 领取租约：Claim 后该时长内其他 Publisher 不可见（须 > producer_timeout）
 
 auth:
