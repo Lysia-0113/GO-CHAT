@@ -18,10 +18,10 @@ redis:
   pool_size: 12
 
 kafka:
-  # 当前消费者实现使用固定的 8MiB 单次读取上限；该值用于保留低配
-  # 部署的批量意图，后续接入可配置 reader 时直接生效。
+  # franz-go 消费者使用固定的 8MiB 单次读取上限；该值用于保留低配部署的批量意图。
   max_poll_records: 20
-  num_partitions: 3                   # ingress/persisted 分区数（persist/deliver worker 按分区路由）
+  inbox_partitions: 3                 # 待持久化 Topic 分区数
+  push_partitions: 3                  # 在线推送 Topic 分区数
   outbox_batch_size: 20
   outbox_worker_count: 1              # 集群全局 slot 数；多实例部署时所有实例设为同一值
   outbox_publish_concurrency: 4       # 每个 slot 同时发布的不同会话数上限

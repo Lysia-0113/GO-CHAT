@@ -79,7 +79,7 @@ type PersistInput struct {
 	MemberIDs []int64
 }
 
-// MessageIngressEvent 是 im.message.ingress 载荷（GOCHAT_KAFKA.md §5.2）。
+// MessageIngressEvent 是 im.message.inbox 载荷（GOCHAT_KAFKA.md §5.2）。
 type MessageIngressEvent struct {
 	SenderID        int64           `json:"sender_id"`
 	ClientMessageID string          `json:"client_msg_id"`
@@ -89,7 +89,9 @@ type MessageIngressEvent struct {
 	ClientSentAt    *time.Time      `json:"client_sent_at,omitempty"`
 }
 
-// MessagePersistedEvent 是 im.message.persisted 载荷（GOCHAT_KAFKA.md §5.3）。
+// MessagePersistedEvent 是 Outbox 内部持久化事件载荷。
+// 它不会再直接写入 Kafka；Outbox Publisher 会根据 MemberIDs 和 Presence
+// 将它转换为 MessagePushEvent。
 type MessagePersistedEvent struct {
 	MessageID       int64           `json:"message_id"`
 	Seq             int64           `json:"seq"`
@@ -100,8 +102,24 @@ type MessagePersistedEvent struct {
 	Content         json.RawMessage `json:"content"`
 	ContentPreview  string          `json:"content_preview,omitempty"`
 	CreatedAt       time.Time       `json:"created_at"`
-	// MemberIDs 是发送时刻的会话成员快照（广播投递用；旧事件为空时投递侧回退查库）。
+	// MemberIDs 是发送时刻的会话成员快照，供 Outbox 路由在线用户。
 	MemberIDs []int64 `json:"member_ids,omitempty"`
+}
+
+// MessagePushEvent 是 im.message.push 载荷。
+// TargetUserIDs 是当前路由到目标 Gateway partition 的用户集合；Gateway
+// 只处理这些用户，本机没有对应连接时直接提交 offset，客户端通过 Pull 补齐。
+type MessagePushEvent struct {
+	MessageID       int64           `json:"message_id"`
+	Seq             int64           `json:"seq"`
+	SenderID        int64           `json:"sender_id"`
+	ClientMessageID string          `json:"client_msg_id"`
+	ConversationID  int64           `json:"conversation_id"`
+	MessageType     int8            `json:"message_type"`
+	Content         json.RawMessage `json:"content"`
+	ContentPreview  string          `json:"content_preview,omitempty"`
+	CreatedAt       time.Time       `json:"created_at"`
+	TargetUserIDs   []int64         `json:"target_user_ids,omitempty"`
 }
 
 // ReadEvent 是已读推进通知（message.read）。

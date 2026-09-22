@@ -211,6 +211,38 @@ func TestPresenceStaleCleanup(t *testing.T) {
 	}
 }
 
+func TestPresenceBatchLookup(t *testing.T) {
+	client, _ := newTestRedis(t)
+	presence := NewPresenceRegistry(client, 90*time.Second, 3*time.Minute, testOpts())
+	ctx := context.Background()
+
+	routeA := connectionRoute(301, "conn-a", "web-a", "node-1")
+	routeA.PartitionID = 1
+	routeB := connectionRoute(302, "conn-b", "web-b", "node-2")
+	routeB.PartitionID = 2
+	if err := presence.Register(ctx, routeA); err != nil {
+		t.Fatal(err)
+	}
+	if err := presence.Register(ctx, routeB); err != nil {
+		t.Fatal(err)
+	}
+	// 模拟 ZSET 仍有成员但连接路由 HASH 已先过期的竞态。
+	if err := client.Del(ctx, PresenceConnKey("conn-b")).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	routes, err := presence.OnlineConnectionsBatch(ctx, []int64{301, 302, 301})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes[301]) != 1 || routes[301][0].PartitionID != 1 {
+		t.Fatalf("unexpected user 301 routes: %+v", routes[301])
+	}
+	if len(routes[302]) != 0 {
+		t.Fatalf("missing HASH route should be ignored: %+v", routes[302])
+	}
+}
+
 // TestCursorStore 同步游标：缺失读取、只增不减、会话内用户互不影响（GOCHAT_REDIS.md §10）。
 func TestCursorStore(t *testing.T) {
 	client, scripts := newTestRedis(t)

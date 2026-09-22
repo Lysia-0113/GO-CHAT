@@ -23,9 +23,9 @@ type Envelope struct {
 
 // 事件类型常量。
 const (
-	EventIngress   = "message.ingress"
-	EventPersisted = "message.persisted"
-	EventDLQ       = "message.dlq"
+	EventInbox = "message.inbox"
+	EventPush  = "message.push"
+	EventDLQ   = "message.dlq"
 )
 
 // SchemaVersion 是当前 Envelope/Data 版本（禁止静默修改字段语义）。

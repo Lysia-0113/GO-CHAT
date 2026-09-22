@@ -35,7 +35,6 @@ type SyncCursorStore interface {
 // MessagePublisher 是消息事件发布接口（GOCHAT_API.md §12.5）。
 type MessagePublisher interface {
 	PublishIngress(ctx context.Context, event MessageIngressEvent) error
-	PublishPersisted(ctx context.Context, event MessagePersistedEvent) error
 }
 
 // RateLimiter 是发送/查询限流接口（L2 Redis 令牌桶 + L1 本地兜底）。

@@ -93,7 +93,7 @@ func (r *MessageRepository) ListAfter(ctx context.Context, conversationID, after
 //	3. next_seq = last_seq + 1
 //	4. INSERT messages
 //	5. UPDATE conversations（last_seq、最新消息摘要）
-//	6. INSERT message_outbox（message_persisted 事件）
+//	6. INSERT message_outbox（待发布到在线推送 Topic 的内部事件）
 //	COMMIT
 //
 // 任一错误整体回滚，不允许留下"已递增但无消息"的 last_seq。
@@ -191,7 +191,7 @@ func (r *MessageRepository) Persist(ctx context.Context, input message.PersistIn
 		}
 		outbox := &model.MessageOutbox{
 			MessageID:   m.MessageID,
-			EventType:   model.OutboxEventPersisted,
+			EventType:   model.OutboxEventPush,
 			ShardID:     message.OutboxShardID(m.ConversationID),
 			Payload:     string(payload),
 			Status:      model.OutboxPending,

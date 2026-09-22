@@ -16,7 +16,6 @@ import (
 type fakePublisher struct {
 	mu          sync.Mutex
 	ingress     []MessageIngressEvent
-	persisted   []MessagePersistedEvent
 	failPublish bool
 }
 
@@ -27,13 +26,6 @@ func (f *fakePublisher) PublishIngress(ctx context.Context, e MessageIngressEven
 		return errs.New(errs.KafkaUnavailable, "kafka down")
 	}
 	f.ingress = append(f.ingress, e)
-	return nil
-}
-
-func (f *fakePublisher) PublishPersisted(ctx context.Context, e MessagePersistedEvent) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.persisted = append(f.persisted, e)
 	return nil
 }
 

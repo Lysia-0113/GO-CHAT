@@ -12,7 +12,7 @@ type Topics struct {
 }
 
 // NewTopics 创建 Topic 集合；prefix 为空或 "." 时使用无后缀名。
-// 示例：prefix="dev" → "im.message.ingress.dev"。
+// 示例：prefix="dev" → "im.message.inbox.dev"。
 func NewTopics(prefix string) Topics {
 	prefix = strings.Trim(prefix, ".")
 	return Topics{prefix: prefix}
@@ -25,11 +25,11 @@ func (t Topics) withSuffix(name string) string {
 	return name + "." + t.prefix
 }
 
-// Ingress 待持久化消息入口 Topic。
-func (t Topics) Ingress() string { return t.withSuffix("im.message.ingress") }
+// Inbox 待持久化消息入口 Topic。
+func (t Topics) Inbox() string { return t.withSuffix("im.message.inbox") }
 
-// Persisted 消息落库后的事件总线 Topic。
-func (t Topics) Persisted() string { return t.withSuffix("im.message.persisted") }
+// Push Outbox 直接发布的在线推送 Topic；该 Topic 使用显式 Gateway partition。
+func (t Topics) Push() string { return t.withSuffix("im.message.push") }
 
 // DLQ 超过重试次数的失败消息 Topic。
 func (t Topics) DLQ() string { return t.withSuffix("im.message.dlq") }

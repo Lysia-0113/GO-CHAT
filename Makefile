@@ -1,7 +1,7 @@
 GO ?= go
 CONFIG ?= ./config/config.yaml
 
-.PHONY: build run migrate test test-race vet lint tidy fmt docker-build docker-up docker-migrate docker-logs
+.PHONY: build run migrate test test-race vet lint tidy fmt kafka-init docker-build docker-up docker-migrate docker-logs
 
 build:
 	$(GO) build -o bin/gochat ./cmd/server
@@ -27,6 +27,9 @@ lint:
 tidy:
 	$(GO) mod tidy
 
+kafka-init:
+	./scripts/init-kafka.sh
+
 fmt:
 	gofmt -l -w .
 
@@ -36,9 +39,11 @@ fmt:
 docker-build:
 	docker compose build
 
-# 全家桶启动：mysql + redis + kafka + app（首次会自动构建镜像）
+# 启动依赖、初始化 Kafka Topic，再启动 app（首次会自动构建镜像）
 docker-up:
-	docker compose up -d
+	docker compose up -d mysql redis kafka
+	KAFKA_USE_DOCKER=1 ./scripts/init-kafka.sh
+	docker compose up -d app
 
 # 初始化数据库表（只跑一次；之后再跑也不会重复建表）
 docker-migrate:

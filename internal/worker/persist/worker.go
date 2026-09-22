@@ -56,7 +56,7 @@ func New(svcCtx *svc.ServiceContext, cfg Config) *Worker {
 	}
 }
 
-// Run 消费 im.message.ingress 直至 ctx 取消。
+// Run 消费 im.message.inbox 直至 ctx 取消。
 // 返回 nil 表示优雅退出。
 //
 // 并发模型：1 个分发 goroutine 拉取消息并按分区号投递到 per-partition 队列，
@@ -141,7 +141,7 @@ func (w *Worker) handleWithRetry(appCtx context.Context, msg kafkainfra.Message)
 	}
 }
 
-// handle 处理单条 ingress 事件。
+// handle 处理单条 inbox 事件。
 // 返回 (是否已提交 Offset, 错误)。
 func (w *Worker) handle(appCtx context.Context, msg kafkainfra.Message) (bool, error) {
 	// 1. 解析 Envelope（GOCHAT_KAFKA.md §7.3）
@@ -168,15 +168,15 @@ func (w *Worker) handle(appCtx context.Context, msg kafkainfra.Message) (bool, e
 		return w.dlqAndCommit(appCtx, msg, env, string(errs.As(err).Code), errs.As(err).Message, 0)
 	}
 
-	// 查询会话成员快照（1× 查询，位于事务外）：随 persisted 事件携带，
-	// 广播投递侧零查询扇出。失败可重试，无副作用。
+	// 查询会话成员快照（1× 查询，位于事务外）：随 Outbox 内部事件携带，
+	// 供 Outbox Publisher 做 Presence 定向路由。失败可重试，无副作用。
 	memberIDs, err := w.svcCtx.ConvRepo.ListMemberIDs(appCtx, ingress.ConversationID)
 	if err != nil {
 		return false, err
 	}
 
 	// 2. 幂等检查：已存在则只推进 Offset（单写者原则，GOCHAT_DATABASE.md §10）。
-	//    不在此补发 persisted：消息落库时已与 outbox 行同事务提交，persisted 事件
+	//    不在此补发 push：消息落库时已与 outbox 行同事务提交，push 事件
 	//    只由 Outbox Publisher 发布；此处补发会在 commit 失败重试时反复发布同一
 	//    message_id，成为重复投递源（outbox 死行恢复见后续迭代）。
 	existing, err := w.svcCtx.MsgRepo.FindByClientMessageID(appCtx, ingress.SenderID, ingress.ClientMessageID)

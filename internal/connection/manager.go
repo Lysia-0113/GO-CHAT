@@ -33,8 +33,9 @@ type PushFailure struct {
 
 // Manager 是进程内 ConnectionManager（V1 单节点实现，GOCHAT_API.md §13.1）。
 type Manager struct {
-	nodeID   string
-	presence PresenceRegistry
+	nodeID      string
+	partitionID int
+	presence    PresenceRegistry
 
 	mu     sync.RWMutex
 	conns  map[string]Connection
@@ -45,11 +46,18 @@ type Manager struct {
 
 // NewManager 创建连接管理器。
 func NewManager(nodeID string, presence PresenceRegistry) *Manager {
+	return NewManagerWithPartition(nodeID, 0, presence)
+}
+
+// NewManagerWithPartition 创建带固定 Gateway partition 的连接管理器。
+// partitionID 会写入 Presence，供 Outbox Worker 将在线用户路由到正确 partition。
+func NewManagerWithPartition(nodeID string, partitionID int, presence PresenceRegistry) *Manager {
 	return &Manager{
-		nodeID:   nodeID,
-		presence: presence,
-		conns:    make(map[string]Connection),
-		byUser:   make(map[int64]map[string]struct{}),
+		nodeID:      nodeID,
+		partitionID: partitionID,
+		presence:    presence,
+		conns:       make(map[string]Connection),
+		byUser:      make(map[int64]map[string]struct{}),
 	}
 }
 
@@ -65,13 +73,14 @@ func (m *Manager) Register(ctx context.Context, conn Connection) error {
 	m.active.Add(1)
 
 	if m.presence != nil {
-		// 连接已在本机 map 注册，Presence 仅是为未来的在线状态功能维护的副本：
-		// 广播模型下投递链路不查询 Presence，写入失败不影响连接可用性与在线投递
+		// 连接已在本机 map 注册，Presence 是跨实例定向投递的路由副本；
+		// 写入失败不影响连接建立，客户端可通过重连和 after_seq 补偿。
 		_ = m.presence.Register(ctx, ConnectionRoute{
 			ConnectionID: conn.ID(),
 			UserID:       conn.UserID(),
 			DeviceID:     conn.DeviceID(),
 			NodeID:       m.nodeID,
+			PartitionID:  m.partitionID,
 		})
 	}
 	return nil
@@ -146,3 +155,6 @@ func (m *Manager) Count() int64 { return m.active.Load() }
 
 // NodeID 返回本网关节点标识。
 func (m *Manager) NodeID() string { return m.nodeID }
+
+// PartitionID 返回本网关固定绑定的 Kafka push partition。
+func (m *Manager) PartitionID() int { return m.partitionID }

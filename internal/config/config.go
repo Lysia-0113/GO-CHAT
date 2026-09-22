@@ -33,6 +33,8 @@ type ServerConfig struct {
 	Addr string `yaml:"addr"`
 	// NodeID 多网关节点唯一标识；单节点部署可留空，默认 "node-1"
 	NodeID string `yaml:"node_id"`
+	// GatewayPartitionID 当前实例固定消费的 im.message.push partition。
+	GatewayPartitionID int `yaml:"gateway_partition_id"`
 	// ShutdownTimeout 优雅退出等待时间
 	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
 	// WSReadLimit 单个 WebSocket Frame 最大字节数
@@ -72,16 +74,15 @@ type RedisConfig struct {
 
 type KafkaConfig struct {
 	Brokers []string `yaml:"brokers"`
-	// TopicPrefix 环境后缀之前缀，如 "im.message.ingress.dev"
+	// TopicPrefix 环境后缀之前缀，如 "im.message.inbox.dev"
 	TopicPrefix string `yaml:"topic_prefix"`
 	// Producer 配置
 	ProducerTimeout time.Duration `yaml:"producer_timeout"`
 	ProducerAcksAll bool          `yaml:"producer_acks_all"`
 	// Consumer Group 名
 	PersistGroup string `yaml:"persist_group"`
-	// DeliveryGroup 是投递组名前缀：广播模型下实际组名 = delivery_group + "-" + node_id，
-	// 每个节点独立组、各自消费全量分区（GOCHAT_KAFKA.md §9 广播投递）
-	DeliveryGroup string `yaml:"delivery_group"`
+	// PushOffsetGroup 是固定 Gateway partition 的 offset 命名空间；它不触发再平衡。
+	PushOffsetGroup string `yaml:"push_offset_group"`
 	// DLQGroup 死信队列消费组（最小版消费者：仅计数，/metrics 可查）
 	DLQGroup string `yaml:"dlq_group"`
 	// Consumer 配置
@@ -90,8 +91,10 @@ type KafkaConfig struct {
 	// 持久化失败重试：最大次数 + 退避序列
 	PersistMaxRetries int           `yaml:"persist_max_retries"`
 	PersistBackoff    time.Duration `yaml:"persist_backoff"`
-	// NumPartitions ingress topic 分区数（persist worker 按分区路由，保证同分区串行）
-	NumPartitions int `yaml:"num_partitions"`
+	// InboxPartitions 待持久化 Topic 分区数（按 conversation_id 哈希）。
+	InboxPartitions int `yaml:"inbox_partitions"`
+	// PushPartitions 在线推送 Topic 分区数（一个 Gateway 实例固定一个 partition）。
+	PushPartitions int `yaml:"push_partitions"`
 	// Outbox Publisher 配置
 	OutboxMaxRetries   int           `yaml:"outbox_max_retries"`
 	OutboxBackoff      time.Duration `yaml:"outbox_backoff"`
@@ -177,7 +180,7 @@ type ResilienceConfig struct {
 }
 
 type BreakerConfig struct {
-	// Name 形如 "redis:recent_get"、"kafka:ingress_publish"、"mysql:history_query"
+	// Name 形如 "redis:recent_get"、"kafka:inbox_publish"、"mysql:history_query"
 	Name         string        `yaml:"name"`
 	Interval     time.Duration `yaml:"interval"`
 	MinRequests  uint32        `yaml:"min_requests"`
@@ -223,6 +226,7 @@ func defaultConfig() *Config {
 		Server: ServerConfig{
 			Addr:                ":8080",
 			NodeID:              "node-1",
+			GatewayPartitionID:  0,
 			ShutdownTimeout:     10 * time.Second,
 			WSReadLimit:         64 * 1024,
 			WSHeartbeatInterval: 30 * time.Second,
@@ -252,13 +256,14 @@ func defaultConfig() *Config {
 			ProducerTimeout:          3 * time.Second,
 			ProducerAcksAll:          true,
 			PersistGroup:             "gochat-message-persist-v1",
-			DeliveryGroup:            "gochat-message-delivery-v1",
+			PushOffsetGroup:          "gochat-message-push-v1",
 			DLQGroup:                 "gochat-message-dlq-v1",
 			AutoOffsetReset:          "earliest",
 			MaxPollRecords:           100,
 			PersistMaxRetries:        5,
 			PersistBackoff:           200 * time.Millisecond,
-			NumPartitions:            3,
+			InboxPartitions:          3,
+			PushPartitions:           3,
 			OutboxMaxRetries:         10,
 			OutboxBackoff:            2 * time.Second,
 			OutboxPollInterval:       500 * time.Millisecond,
@@ -316,9 +321,8 @@ func defaultConfig() *Config {
 
 			Breakers: []BreakerConfig{
 				{Name: "redis:recent_get", Interval: 10 * time.Second, MinRequests: 20, FailureRatio: 0.5, OpenTimeout: 5 * time.Second, HalfOpenMax: 3},
-				{Name: "redis:gateway_publish", Interval: 10 * time.Second, MinRequests: 20, FailureRatio: 0.5, OpenTimeout: 5 * time.Second, HalfOpenMax: 3},
-				{Name: "kafka:ingress_publish", Interval: 10 * time.Second, MinRequests: 10, FailureRatio: 0.3, OpenTimeout: 3 * time.Second, HalfOpenMax: 3},
-				{Name: "kafka:persisted_publish", Interval: 10 * time.Second, MinRequests: 10, FailureRatio: 0.3, OpenTimeout: 5 * time.Second, HalfOpenMax: 3},
+				{Name: "kafka:inbox_publish", Interval: 10 * time.Second, MinRequests: 10, FailureRatio: 0.3, OpenTimeout: 3 * time.Second, HalfOpenMax: 3},
+				{Name: "kafka:push_publish", Interval: 10 * time.Second, MinRequests: 10, FailureRatio: 0.3, OpenTimeout: 5 * time.Second, HalfOpenMax: 3},
 				{Name: "mysql:history_query", Interval: 10 * time.Second, MinRequests: 20, FailureRatio: 0.5, OpenTimeout: 3 * time.Second, HalfOpenMax: 3},
 				{Name: "mysql:id_segment", Interval: 30 * time.Second, MinRequests: 5, FailureRatio: 0.6, OpenTimeout: 10 * time.Second, HalfOpenMax: 1},
 			},
@@ -333,6 +337,7 @@ func defaultConfig() *Config {
 func applyEnvOverrides(cfg *Config) {
 	setStr("GOChat_SERVER_ADDR", &cfg.Server.Addr)
 	setStr("GOChat_SERVER_NODE_ID", &cfg.Server.NodeID)
+	setInt("GOChat_SERVER_GATEWAY_PARTITION_ID", &cfg.Server.GatewayPartitionID)
 	setStr("GOChat_MYSQL_DSN", &cfg.MySQL.DSN)
 	setStr("GOChat_REDIS_ADDR", &cfg.Redis.Addr)
 	setStr("GOChat_REDIS_PASSWORD", &cfg.Redis.Password)
@@ -341,6 +346,10 @@ func applyEnvOverrides(cfg *Config) {
 	setInt("GOChat_SERVER_WS_WRITE_QUEUE_SIZE", &cfg.Server.WSWriteQueueSize)
 	setInt("GOChat_KAFKA_OUTBOX_WORKER_COUNT", &cfg.Kafka.OutboxWorkerCount)
 	setInt("GOChat_KAFKA_OUTBOX_PUBLISH_CONCURRENCY", &cfg.Kafka.OutboxPublishConcurrency)
+	setStr("GOChat_KAFKA_TOPIC_PREFIX", &cfg.Kafka.TopicPrefix)
+	setInt("GOChat_KAFKA_INBOX_PARTITIONS", &cfg.Kafka.InboxPartitions)
+	setInt("GOChat_KAFKA_PUSH_PARTITIONS", &cfg.Kafka.PushPartitions)
+	setStr("GOChat_KAFKA_PUSH_OFFSET_GROUP", &cfg.Kafka.PushOffsetGroup)
 	setStr("GOChat_KAFKA_BROKERS", &kafkaBrokersEnv) // 逗号分隔，最后统一处理
 }
 

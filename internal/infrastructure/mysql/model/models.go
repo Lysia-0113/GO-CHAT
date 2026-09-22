@@ -117,7 +117,9 @@ const (
 	OutboxDLQPending int8 = 4
 )
 
-// Outbox 事件类型。
+// Outbox 事件类型。值 1 沿用已有 message_outbox 数据，语义从 persisted
+// 调整为 Outbox 发布到在线推送 Topic。
 const (
-	OutboxEventPersisted int8 = 1
+	OutboxEventPush      int8 = 1
+	OutboxEventPersisted int8 = OutboxEventPush // 兼容已有代码与历史数据
 )

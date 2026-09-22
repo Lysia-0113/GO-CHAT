@@ -22,20 +22,11 @@ func NewPublisher(producer *Producer, producerName string) *Publisher {
 	return &Publisher{producer: producer, producerName: producerName}
 }
 
-// PublishIngress 发布待持久化事件（Key=conversation_id）。
+// PublishIngress 发布待持久化事件到 inbox Topic（Key=conversation_id）。
 func (p *Publisher) PublishIngress(ctx context.Context, event message.MessageIngressEvent) error {
-	env, err := NewEnvelope(EventIngress, p.producerName, event.ConversationID, event)
+	env, err := NewEnvelope(EventInbox, p.producerName, event.ConversationID, event)
 	if err != nil {
 		return errsInternal(err)
 	}
 	return p.producer.PublishIngress(ctx, env)
-}
-
-// PublishPersisted 发布持久化事件。
-func (p *Publisher) PublishPersisted(ctx context.Context, event message.MessagePersistedEvent) error {
-	env, err := NewEnvelope(EventPersisted, p.producerName, event.ConversationID, event)
-	if err != nil {
-		return errsInternal(err)
-	}
-	return p.producer.PublishPersisted(ctx, env)
 }

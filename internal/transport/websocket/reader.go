@@ -198,6 +198,7 @@ func (h *Handler) refreshPresence(ctx context.Context, conn *Conn) {
 		UserID:       conn.UserID(),
 		DeviceID:     conn.DeviceID(),
 		NodeID:       h.svcCtx.ConnManager.NodeID(),
+		PartitionID:  h.svcCtx.ConnManager.PartitionID(),
 	}
 	ctx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
 	defer cancel()

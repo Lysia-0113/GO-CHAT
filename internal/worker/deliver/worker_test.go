@@ -57,9 +57,19 @@ func newPushFailureWorker(t *testing.T) (*Worker, kafka.Message) {
 		MessageType:     message.TypeText,
 		Content:         json.RawMessage(`{"text":"hello"}`),
 		CreatedAt:       time.Now().UTC(),
-		MemberIDs:       []int64{2},
 	}
-	env, err := kafka.NewEnvelope(kafka.EventPersisted, "test", event.ConversationID, event)
+	pushEvent := message.MessagePushEvent{
+		MessageID:       event.MessageID,
+		Seq:             event.Seq,
+		SenderID:        event.SenderID,
+		ClientMessageID: event.ClientMessageID,
+		ConversationID:  event.ConversationID,
+		MessageType:     event.MessageType,
+		Content:         event.Content,
+		CreatedAt:       event.CreatedAt,
+		TargetUserIDs:   []int64{2},
+	}
+	env, err := kafka.NewEnvelope(kafka.EventPush, "test", event.ConversationID, pushEvent)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +77,7 @@ func newPushFailureWorker(t *testing.T) (*Worker, kafka.Message) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return worker, kafka.Message{Topic: "im.message.persisted.dev", Partition: 2, Offset: 44, Value: raw}
+	return worker, kafka.Message{Topic: "im.message.push.dev", Partition: 2, Offset: 44, Value: raw}
 }
 
 func TestHandleWritesPushFailureToDLQBeforeOffsetCommit(t *testing.T) {

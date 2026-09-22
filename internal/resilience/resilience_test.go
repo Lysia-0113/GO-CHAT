@@ -31,14 +31,14 @@ func TestBreakerOnlyCountsTechnicalFailures(t *testing.T) {
 
 	// 场景 B：技术失败达到阈值 → Open，且 Open 期间不再调用依赖
 	tech := NewBreakers([]BreakerConfig{
-		{Name: "kafka:ingress_publish", Interval: time.Second, MinRequests: 3, FailureRatio: 0.5, OpenTimeout: 50 * time.Millisecond, HalfOpenMax: 1},
+		{Name: "kafka:inbox_publish", Interval: time.Second, MinRequests: 3, FailureRatio: 0.5, OpenTimeout: 50 * time.Millisecond, HalfOpenMax: 1},
 	})
 	for i := 0; i < 5; i++ {
-		_ = tech.ExecuteByName(context.Background(), "kafka:ingress_publish", func() error {
+		_ = tech.ExecuteByName(context.Background(), "kafka:inbox_publish", func() error {
 			return errs.New(errs.KafkaUnavailable, "kafka down")
 		})
 	}
-	err := tech.ExecuteByName(context.Background(), "kafka:ingress_publish", func() error {
+	err := tech.ExecuteByName(context.Background(), "kafka:inbox_publish", func() error {
 		t.Fatal("fn must not run when breaker open")
 		return nil
 	})

@@ -8,6 +8,7 @@ type ConnectionRoute struct {
 	UserID       int64  `json:"user_id"`
 	DeviceID     string `json:"device_id"`
 	NodeID       string `json:"node_id"`
+	PartitionID  int    `json:"partition_id"`
 }
 
 // PresenceRegistry 是在线状态注册表接口（GOCHAT_API.md §12.7）。

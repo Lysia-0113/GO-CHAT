@@ -146,7 +146,7 @@ var OutboxOldestAge = prometheus.NewGaugeVec(
 
 // DependencyDuration 依赖调用耗时（GOCHAT_RESILIENCE.md §4.2 超时校准）。
 // operation 取值：redis_cursor_read / redis_cursor_write / mysql_history_query
-// / kafka:ingress_publish / kafka:persisted_publish / kafka:dlq_publish。
+// / kafka:inbox_publish / kafka:push_publish / kafka:dlq_publish。
 // 桶位覆盖超时表：Redis 50ms、MySQL 200ms、Kafka 300ms 均在桶内。
 var DependencyDuration = prometheus.NewHistogramVec(
 	prometheus.HistogramOpts{

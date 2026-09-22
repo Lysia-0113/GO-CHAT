@@ -51,7 +51,7 @@ func TestClaimLocksConversationHeadAndSetsLease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	if len(records) != 1 || records[0].MessageID != 100 || records[0].EventType != model.OutboxEventPersisted {
+	if len(records) != 1 || records[0].MessageID != 100 || records[0].EventType != model.OutboxEventPush {
 		t.Fatalf("unexpected records: %+v", records)
 	}
 	if records[0].Status != model.OutboxRetrying || records[0].ConversationID != 10 || records[0].Payload.Seq != 5 {
@@ -67,7 +67,7 @@ func TestMarkPublishedOwned(t *testing.T) {
 	mock.ExpectExec("UPDATE.*message_outbox.*SET.*published_at.*WHERE.*message_id = \\?.*event_type = \\?.*locked_by = \\?").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	applied, err := repo.MarkPublished(context.Background(), 100, model.OutboxEventPersisted, "slot-1-run-a")
+	applied, err := repo.MarkPublished(context.Background(), 100, model.OutboxEventPush, "slot-1-run-a")
 	if err != nil || !applied {
 		t.Fatalf("mark published: applied=%v err=%v", applied, err)
 	}
@@ -81,7 +81,7 @@ func TestMarkPublishedOwnershipLost(t *testing.T) {
 	mock.ExpectExec("UPDATE.*message_outbox.*WHERE.*message_id = \\?.*event_type = \\?.*locked_by = \\?").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
-	applied, err := repo.MarkPublished(context.Background(), 100, model.OutboxEventPersisted, "stale-owner")
+	applied, err := repo.MarkPublished(context.Background(), 100, model.OutboxEventPush, "stale-owner")
 	if err != nil || applied {
 		t.Fatalf("expected stale owner no-op, got applied=%v err=%v", applied, err)
 	}
@@ -97,7 +97,7 @@ func TestMarkFailedSchedulesRetryBeforeLimit(t *testing.T) {
 	mock.ExpectExec("UPDATE.*message_outbox.*SET.*next_retry_at.*WHERE.*message_id = \\?.*event_type = \\?.*locked_by = \\?").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	applied, needsDLQ, err := repo.MarkFailed(context.Background(), 100, model.OutboxEventPersisted,
+	applied, needsDLQ, err := repo.MarkFailed(context.Background(), 100, model.OutboxEventPush,
 		"timeout", 10, 2*time.Second, 5*time.Second, "slot-1-run-a")
 	if err != nil || !applied || needsDLQ {
 		t.Fatalf("expected retry state, got applied=%v needsDLQ=%v err=%v", applied, needsDLQ, err)
@@ -114,7 +114,7 @@ func TestMarkFailedAtLimitQueuesDLQAndKeepsOwner(t *testing.T) {
 	mock.ExpectExec("UPDATE.*message_outbox.*SET.*next_retry_at.*WHERE.*message_id = \\?.*event_type = \\?.*locked_by = \\?").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	applied, needsDLQ, err := repo.MarkFailed(context.Background(), 100, model.OutboxEventPersisted,
+	applied, needsDLQ, err := repo.MarkFailed(context.Background(), 100, model.OutboxEventPush,
 		"timeout", 10, 2*time.Second, 5*time.Second, "slot-1-run-a")
 	if err != nil || !applied || !needsDLQ {
 		t.Fatalf("expected DLQ pending state, got applied=%v needsDLQ=%v err=%v", applied, needsDLQ, err)
@@ -129,7 +129,7 @@ func TestMarkFailedOwnershipLost(t *testing.T) {
 	mock.ExpectQuery("SELECT.*retry_count.*FROM.*message_outbox.*WHERE.*locked_by = \\?.*").
 		WillReturnRows(sqlmock.NewRows([]string{"retry_count"}))
 
-	applied, needsDLQ, err := repo.MarkFailed(context.Background(), 100, model.OutboxEventPersisted,
+	applied, needsDLQ, err := repo.MarkFailed(context.Background(), 100, model.OutboxEventPush,
 		"timeout", 10, 2*time.Second, 5*time.Second, "stale-owner")
 	if err != nil || applied || needsDLQ {
 		t.Fatalf("expected lost ownership no-op, got applied=%v needsDLQ=%v err=%v", applied, needsDLQ, err)
@@ -143,12 +143,12 @@ func TestDLQRetryAndDeadTransitionsAreFenced(t *testing.T) {
 	repo, mock := newMockOutboxRepo(t)
 	mock.ExpectExec("UPDATE.*message_outbox.*SET.*next_retry_at.*WHERE.*status = \\?.*locked_by = \\?").
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	if applied, err := repo.RetryDLQ(context.Background(), 100, model.OutboxEventPersisted, time.Second, "slot-1-run-a"); err != nil || !applied {
+	if applied, err := repo.RetryDLQ(context.Background(), 100, model.OutboxEventPush, time.Second, "slot-1-run-a"); err != nil || !applied {
 		t.Fatalf("retry dlq: applied=%v err=%v", applied, err)
 	}
 	mock.ExpectExec("UPDATE.*message_outbox.*SET.*status.*WHERE.*status = \\?.*locked_by = \\?").
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	if applied, err := repo.MarkDead(context.Background(), 100, model.OutboxEventPersisted, "slot-1-run-a"); err != nil || !applied {
+	if applied, err := repo.MarkDead(context.Background(), 100, model.OutboxEventPush, "slot-1-run-a"); err != nil || !applied {
 		t.Fatalf("mark dead: applied=%v err=%v", applied, err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {

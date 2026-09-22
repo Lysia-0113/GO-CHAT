@@ -15,11 +15,11 @@ func TestEnvelopeRoundTrip(t *testing.T) {
 		MessageType:     message.TypeText,
 		Content:         json.RawMessage(`{"text":"你好"}`),
 	}
-	env, err := NewEnvelope(EventIngress, "ws-gateway", event.ConversationID, event)
+	env, err := NewEnvelope(EventInbox, "ws-gateway", event.ConversationID, event)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if env.SchemaVersion != 1 || env.EventType != EventIngress || env.ConversationID != "9001" {
+	if env.SchemaVersion != 1 || env.EventType != EventInbox || env.ConversationID != "9001" {
 		t.Fatalf("unexpected envelope: %+v", env)
 	}
 	if env.EventID == "" || env.Producer != "ws-gateway" {
@@ -44,12 +44,12 @@ func TestEnvelopeRoundTrip(t *testing.T) {
 
 func TestTopicsSuffix(t *testing.T) {
 	plain := NewTopics("")
-	if plain.Ingress() != "im.message.ingress" || plain.Persisted() != "im.message.persisted" || plain.DLQ() != "im.message.dlq" {
+	if plain.Inbox() != "im.message.inbox" || plain.Push() != "im.message.push" || plain.DLQ() != "im.message.dlq" {
 		t.Fatalf("unexpected topics: %+v", plain)
 	}
 	dev := NewTopics("dev")
-	if dev.Ingress() != "im.message.ingress.dev" {
-		t.Fatalf("unexpected suffixed topic: %s", dev.Ingress())
+	if dev.Inbox() != "im.message.inbox.dev" || dev.Push() != "im.message.push.dev" {
+		t.Fatalf("unexpected suffixed topics: inbox=%s push=%s", dev.Inbox(), dev.Push())
 	}
 }
 
@@ -60,9 +60,9 @@ func TestKeyOf(t *testing.T) {
 }
 
 func TestDLQPayloadKeepsOriginal(t *testing.T) {
-	orig, _ := json.Marshal(Envelope{SchemaVersion: 1, EventType: EventIngress, EventID: "evt_x"})
+	orig, _ := json.Marshal(Envelope{SchemaVersion: 1, EventType: EventInbox, EventID: "evt_x"})
 	payload := DLQPayload{
-		FailedTopic:     "im.message.ingress",
+		FailedTopic:     "im.message.inbox",
 		FailedPartition: 3,
 		FailedOffset:    10882,
 		RetryCount:      5,

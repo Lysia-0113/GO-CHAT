@@ -8,6 +8,7 @@ package bootstrap
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -55,6 +56,15 @@ func NewLogger(cfg config.LogConfig) *slog.Logger {
 // 返回 App 便于 Run 与优雅退出。
 func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*App, error) {
 	cfg.Normalize()
+	if cfg.Kafka.InboxPartitions <= 0 {
+		return nil, errors.New("kafka.inbox_partitions must be greater than 0")
+	}
+	if cfg.Kafka.PushPartitions <= 0 {
+		return nil, errors.New("kafka.push_partitions must be greater than 0")
+	}
+	if cfg.Server.GatewayPartitionID < 0 || cfg.Server.GatewayPartitionID >= cfg.Kafka.PushPartitions {
+		return nil, fmt.Errorf("server.gateway_partition_id must be in [0,%d)", cfg.Kafka.PushPartitions)
+	}
 
 	// ---- 指标注册表 ----
 	reg := metrics.New()
@@ -76,13 +86,14 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*App, err
 	}
 
 	// ---- Kafka ----
+	breakers := newBreakers(cfg)
 	producer, err := kafkainfra.NewProducer(kafkainfra.ProducerConfig{
 		Brokers:     cfg.Kafka.Brokers,
 		Timeout:     cfg.Kafka.ProducerTimeout,
 		AcksAll:     cfg.Kafka.ProducerAcksAll,
 		TopicSuffix: cfg.Kafka.TopicPrefix,
-		Logger:      kafkainfra.SlogLogger(log),
-	}, newBreakers(cfg), "gateway")
+		Logger:      log,
+	}, breakers)
 	if err != nil {
 		return nil, fmt.Errorf("kafka producer: %w", err)
 	}
@@ -141,9 +152,7 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*App, err
 		Conversations:   convRepo,
 		ConversationIDs: convIDs,
 	})
-	connManager := connection.NewManager(cfg.Server.NodeID, presence)
-
-	breakers := newBreakers(cfg)
+	connManager := connection.NewManagerWithPartition(cfg.Server.NodeID, cfg.Server.GatewayPartitionID, presence)
 
 	messages := message.NewService(message.Dependencies{
 		Messages:      msgRepo,
@@ -159,30 +168,30 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*App, err
 	// ---- Worker 消费者 ----
 	persistConsumer, err := kafkainfra.NewConsumer(kafkainfra.ConsumerConfig{
 		Brokers:          cfg.Kafka.Brokers,
-		Topic:            topics.Ingress(),
+		Topic:            topics.Inbox(),
 		Group:            cfg.Kafka.PersistGroup,
 		StartOffset:      cfg.Kafka.AutoOffsetReset,
 		MaxBytes:         8 * 1024 * 1024,
+		MaxPollRecords:   cfg.Kafka.MaxPollRecords,
 		SessionTimeout:   10 * time.Second,
 		RebalanceTimeout: 10 * time.Second,
-		Logger:           kafkainfra.SlogLogger(log),
+		Logger:           log,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("kafka persist consumer: %w", err)
 	}
-	deliverConsumer, err := kafkainfra.NewConsumer(kafkainfra.ConsumerConfig{
-		Brokers: cfg.Kafka.Brokers,
-		Topic:   topics.Persisted(),
-		// 广播模型：每节点独立消费者组（组名带 node_id），各自消费全部分区
-		Group:            cfg.Kafka.DeliveryGroup + "-" + cfg.Server.NodeID,
-		StartOffset:      cfg.Kafka.AutoOffsetReset,
-		MaxBytes:         8 * 1024 * 1024,
-		SessionTimeout:   10 * time.Second,
-		RebalanceTimeout: 10 * time.Second,
-		Logger:           kafkainfra.SlogLogger(log),
+	gatewayConsumer, err := kafkainfra.NewPartitionConsumer(kafkainfra.ConsumerConfig{
+		Brokers:        cfg.Kafka.Brokers,
+		Topic:          topics.Push(),
+		Group:          cfg.Kafka.PushOffsetGroup,
+		Partition:      cfg.Server.GatewayPartitionID,
+		StartOffset:    cfg.Kafka.AutoOffsetReset,
+		MaxBytes:       8 * 1024 * 1024,
+		MaxPollRecords: cfg.Kafka.MaxPollRecords,
+		Logger:         log,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("kafka deliver consumer: %w", err)
+		return nil, fmt.Errorf("kafka gateway consumer: %w", err)
 	}
 	dlqConsumer, err := kafkainfra.NewConsumer(kafkainfra.ConsumerConfig{
 		Brokers:          cfg.Kafka.Brokers,
@@ -190,9 +199,10 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*App, err
 		Group:            cfg.Kafka.DLQGroup,
 		StartOffset:      cfg.Kafka.AutoOffsetReset,
 		MaxBytes:         8 * 1024 * 1024,
+		MaxPollRecords:   cfg.Kafka.MaxPollRecords,
 		SessionTimeout:   10 * time.Second,
 		RebalanceTimeout: 10 * time.Second,
-		Logger:           kafkainfra.SlogLogger(log),
+		Logger:           log,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("kafka dlq consumer: %w", err)
@@ -236,7 +246,7 @@ func Build(ctx context.Context, cfg *config.Config, log *slog.Logger) (*App, err
 		MessageIDs: msgIDs,
 
 		PersistConsumer: persistConsumer,
-		DeliverConsumer: deliverConsumer,
+		GatewayConsumer: gatewayConsumer,
 		DLQConsumer:     dlqConsumer,
 	}
 

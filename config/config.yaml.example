@@ -5,6 +5,7 @@
 server:
   addr: ":8080"                       # HTTP / WebSocket 监听地址
   node_id: "node-1"                   # 多网关节点唯一标识（多节点时区分）
+  gateway_partition_id: 0              # 当前实例固定消费 im.message.push 的 partition
   shutdown_timeout: 10s               # 优雅退出等待
   ws_read_limit: 65536                # 单个 WebSocket Frame 最大字节数
   ws_heartbeat_interval: 30s          # 服务端心跳间隔
@@ -34,17 +35,18 @@ redis:
 kafka:
   brokers:
     - "127.0.0.1:9092"
-  topic_prefix: ""                    # 环境后缀，如 "dev" → im.message.ingress.dev
+  topic_prefix: ""                    # 环境后缀，如 "dev" → im.message.inbox.dev
   producer_timeout: 3s                # 生产超时（入口侧实际使用 resilience.ingress_publish_timeout）
   producer_acks_all: true             # acks=all + min.insync.replicas 配合
   persist_group: "gochat-message-persist-v1"
-  delivery_group: "gochat-message-delivery-v1"  # 广播投递：实际组名 = 该前缀 + "-" + node_id（每节点独立组消费全量）
+  push_offset_group: "gochat-message-push-v1"   # 固定 partition 的 offset 命名空间，不触发再平衡
   dlq_group: "gochat-message-dlq-v1"  # 死信消费组（最小版：仅计数+提交 offset）
   auto_offset_reset: "earliest"       # 新环境 replay 需求：earliest / latest
   max_poll_records: 100
   persist_max_retries: 5              # MySQL 持久化临时失败重试上限
   persist_backoff: 200ms
-  num_partitions: 3                   # ingress/persisted 分区数（persist/deliver worker 按分区路由，保证同分区串行）
+  inbox_partitions: 3                 # 待持久化 Topic 分区数
+  push_partitions: 3                  # 在线推送 Topic 分区数；每个 Gateway 固定一个 partition
   outbox_max_retries: 10              # Outbox 发布失败最大重试，超出进入死信
   outbox_backoff: 2s
   outbox_poll_interval: 500ms
@@ -106,9 +108,8 @@ resilience:
   # 熔断器，按 依赖:操作 维度
   breakers:
     - { name: "redis:recent_get",       interval: 10s, min_requests: 20, failure_ratio: 0.5, open_timeout: 5s,  half_open_max: 3 }
-    - { name: "redis:gateway_publish",  interval: 10s, min_requests: 20, failure_ratio: 0.5, open_timeout: 5s,  half_open_max: 3 }
-    - { name: "kafka:ingress_publish",  interval: 10s, min_requests: 10, failure_ratio: 0.3, open_timeout: 3s,  half_open_max: 3 }
-    - { name: "kafka:persisted_publish",interval: 10s, min_requests: 10, failure_ratio: 0.3, open_timeout: 5s,  half_open_max: 3 }
+    - { name: "kafka:inbox_publish",    interval: 10s, min_requests: 10, failure_ratio: 0.3, open_timeout: 3s,  half_open_max: 3 }
+    - { name: "kafka:push_publish",     interval: 10s, min_requests: 10, failure_ratio: 0.3, open_timeout: 5s,  half_open_max: 3 }
     - { name: "mysql:history_query",    interval: 10s, min_requests: 20, failure_ratio: 0.5, open_timeout: 3s,  half_open_max: 3 }
     - { name: "mysql:id_segment",       interval: 30s, min_requests: 5,  failure_ratio: 0.6, open_timeout: 10s, half_open_max: 1 }
 

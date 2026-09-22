@@ -47,7 +47,7 @@ func NewService(deps Dependencies) *Service {
 
 // Send 处理 WebSocket message.send（GOCHAT_API.md §6.5）。
 //
-// 链路：限流 → 成员校验 → 快速幂等 → Kafka ingress（acks=all）→ accepted。
+// 链路：限流 → 成员校验 → 快速幂等 → Kafka inbox（acks=all）→ accepted。
 // 失败时返回可重试错误，客户端必须复用原 client_msg_id。
 func (s *Service) Send(ctx context.Context, cmd SendMessageCommand) (*SendMessageResult, error) {
 	if cmd.ClientMessageID == "" {

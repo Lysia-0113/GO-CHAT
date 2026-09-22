@@ -66,7 +66,8 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_NUM_PARTITIONS: 3
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # Topic 由 scripts/init-kafka.sh 显式创建，避免应用/客户端误建错分区数。
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
       KAFKA_LOG_RETENTION_HOURS: 24
       KAFKA_LOG_RETENTION_BYTES: 1073741824
       KAFKA_LOG_SEGMENT_BYTES: 268435456
@@ -97,7 +98,6 @@ services:
   # GO-CHAT 应用服务
   app:
     build: .
-    container_name: gochat-app
     depends_on:
       mysql:
         condition: service_healthy
@@ -110,9 +110,16 @@ services:
     environment:
       GOChat_CONFIG: "/app/config/config.yaml"
       GOChat_SERVER_ADDR: ":8080"
+      # 多实例部署时为每个实例显式设置不同的节点 ID，并把它固定绑定到
+      # 一个唯一的 Gateway partition；不要让多个实例共享同一个 partition。
+      GOChat_SERVER_NODE_ID: "${GOCHAT_NODE_ID:-node-1}"
+      GOChat_SERVER_GATEWAY_PARTITION_ID: "${GOCHAT_GATEWAY_PARTITION_ID:-0}"
       GOChat_MYSQL_DSN: "${MYSQL_USER:-gochat}:${MYSQL_PASSWORD:?}@tcp(mysql:3306)/${MYSQL_DATABASE:-gochat}?charset=utf8mb4&parseTime=True&loc=UTC"
       GOChat_REDIS_ADDR: "redis:6379"
       GOChat_KAFKA_BROKERS: "kafka:9092"
+      GOChat_KAFKA_TOPIC_PREFIX: "${GOCHAT_KAFKA_TOPIC_PREFIX:-}"
+      GOChat_KAFKA_INBOX_PARTITIONS: "${GOCHAT_INBOX_PARTITIONS:-3}"
+      GOChat_KAFKA_PUSH_PARTITIONS: "${GOCHAT_PUSH_PARTITIONS:-3}"
       GOChat_AUTH_JWT_SECRET: "${GOCHAT_JWT_SECRET:?请在 .env 中设置 GOCHAT_JWT_SECRET}"
     mem_limit: 384m
     healthcheck:

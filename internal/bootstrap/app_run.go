@@ -12,7 +12,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus"
-	kafkago "github.com/segmentio/kafka-go"
 
 	"github.com/Lysia-0113/GO-CHAT/internal/infrastructure/idgen/segment"
 	"github.com/Lysia-0113/GO-CHAT/internal/message"
@@ -52,7 +51,7 @@ func (a *App) Run(appCtx context.Context) error {
 		MaxRetries:    a.svcCtx.Config.Kafka.PersistMaxRetries,
 		Backoff:       a.svcCtx.Config.Kafka.PersistBackoff,
 		TxTimeout:     a.svcCtx.Config.Resilience.PersistTxTimeout,
-		NumPartitions: a.svcCtx.Config.Kafka.NumPartitions,
+		NumPartitions: a.svcCtx.Config.Kafka.InboxPartitions,
 	})
 	outboxPublisher := outbox.New(a.svcCtx, outbox.Config{
 		MaxRetries:         a.svcCtx.Config.Kafka.OutboxMaxRetries,
@@ -63,9 +62,7 @@ func (a *App) Run(appCtx context.Context) error {
 		PublishConcurrency: a.svcCtx.Config.Kafka.OutboxPublishConcurrency,
 		ClaimLease:         a.svcCtx.Config.Kafka.OutboxClaimLease,
 	})
-	deliverWorker := deliver.New(a.svcCtx, deliver.Config{
-		NumPartitions: a.svcCtx.Config.Kafka.NumPartitions,
-	})
+	deliverWorker := deliver.New(a.svcCtx, deliver.Config{})
 	dlqWorker := dlq.New(a.svcCtx)
 
 	// persist：1 个分发 goroutine + 每分区 1 个处理 goroutine（按分区串行，保证会话顺序）
@@ -80,7 +77,7 @@ func (a *App) Run(appCtx context.Context) error {
 			a.svcCtx.Log.Error("dlq worker exited", "error", err.Error())
 		}
 	}()
-	// deliver：与 persist 相同的分区串行模型（1 分发 + 每分区 1 处理）
+	// gateway：固定消费当前实例绑定的单个 push partition
 	go func() {
 		if err := deliverWorker.Run(appCtx); err != nil {
 			a.svcCtx.Log.Error("deliver worker exited", "error", err.Error())
@@ -141,7 +138,7 @@ func (a *App) Run(appCtx context.Context) error {
 		a.svcCtx.Log.Warn("http shutdown", "error", err.Error())
 	}
 	a.svcCtx.PersistConsumer.Close()
-	a.svcCtx.DeliverConsumer.Close()
+	a.svcCtx.GatewayConsumer.Close()
 	a.svcCtx.DLQConsumer.Close()
 	a.svcCtx.Kafka.Close()
 	if sqlDB, err := a.svcCtx.DB.DB(); err == nil {
@@ -154,13 +151,7 @@ func (a *App) Run(appCtx context.Context) error {
 
 // kafkaReady 就绪探针：能读取 Topic 元数据即视为可用。
 func (a *App) kafkaReady(ctx context.Context) error {
-	client := &kafkago.Client{
-		Addr:    kafkago.TCP(a.svcCtx.Config.Kafka.Brokers...),
-		Timeout: 2 * time.Second,
-	}
-	_, err := client.Metadata(ctx, &kafkago.MetadataRequest{})
-	// Client 无显式 Close：请求完成后由 Transport 连接池回收
-	return err
+	return a.svcCtx.Kafka.Ping(ctx)
 }
 
 // metricsLoop 周期刷新仪表盘指标。

@@ -18,12 +18,12 @@
 客户端
   ↓ WebSocket message.send
 Gin / WebSocket Gateway（鉴权、成员校验、限流、快速幂等）
-  ↓ Kafka im.message.ingress（Key = conversation_id，acks=all）
+  ↓ Kafka im.message.inbox（Key = conversation_id，acks=all）
 Persist Worker（MySQL 事务：messages + conversations.last_seq + message_outbox）
-  ↓ Outbox Publisher
-Kafka im.message.persisted
-  ↓ Delivery Worker
-Redis 最近消息缓存 + 在线路由 → 本机 ConnectionManager / 跨节点 Pub/Sub
+  ↓ Outbox Publisher 查询 Redis Presence，按固定 Gateway partition 分组
+Kafka im.message.push（TargetUserIDs = user_id[]，显式写入目标 partition）
+  ↓ 每个实例固定消费一个 partition
+Gateway Worker → 本机 ConnectionManager
   ↓
 接收方 WebSocket（message.new / message.persisted）
 ```
@@ -32,11 +32,23 @@ Redis 最近消息缓存 + 在线路由 → 本机 ConnectionManager / 跨节点
 
 ## 快速开始
 
-### 1. 启动依赖（MySQL / Redis / Kafka）
+### 1. 启动依赖并初始化 Kafka Topic（MySQL / Redis / Kafka）
 
 ```bash
-docker compose up -d
+cp .env.example .env
+# 填写 MYSQL_ROOT_PASSWORD、MYSQL_PASSWORD、GOCHAT_JWT_SECRET
+make docker-up       # 启动依赖、显式创建/校验两条业务 Topic + DLQ，再启动 app
+# 或手动执行：
+# docker compose up -d mysql redis kafka
+# KAFKA_USE_DOCKER=1 make kafka-init
+# docker compose up -d app
 ```
+
+Kafka 只由 `scripts/init-kafka.sh` 创建两条业务 Topic：`im.message.inbox`、
+`im.message.push`，以及一条辅助死信 Topic `im.message.dlq`；应用启动不会自动建
+Topic。`im.message.inbox` 与
+`im.message.push` 的分区数在扩容前规划好，Gateway 实例通过
+`GOCHAT_GATEWAY_PARTITION_ID` 固定绑定一个 push partition。
 
 ### 2. 配置
 
@@ -82,7 +94,7 @@ websocat "ws://localhost:8080/ws?ticket=$TICKET"
 
 # 5. 发送消息（连接建立后）
 #   {"event":"message.send","request_id":"r1","data":{"client_msg_id":"<uuidv7>","conversation_id":"<conv_id>","content_type":"text","content":{"text":"你好"}}}
-#   预期收到 message.accepted →（持久化后）message.persisted；接收方收到 message.new
+#   预期收到 message.accepted →（持久化后）message.persisted；其他在线接收方收到 message.new
 
 # 6. 离线补偿：断开后发送新消息，重连后
 curl -s "localhost:8080/api/v1/conversations/<conv_id>/messages?after_seq=<本地seq>&limit=100" \
@@ -132,8 +144,8 @@ internal/
 │   └── websocket/     # Ticket 升级/读写循环/心跳/慢连接治理
 └── worker/
     ├── persist/       # Kafka → MySQL 持久化
-    ├── outbox/        # Outbox → persisted Topic
-    └── deliver/       # persisted → 缓存 + 在线投递
+    ├── outbox/        # Outbox → Presence 路由 → push Topic
+    └── deliver/       # 固定 push partition → 本机在线投递
 migrations/            # 数据表与 Outbox 分片的版本化 SQL
 config/                # 配置示例
 ```
@@ -144,16 +156,16 @@ config/                # 配置示例
 - **幂等**：Redis SET NX 快速拦截（nonce 条件更新）+ `uk_messages_sender_client (sender_id, client_msg_id)` 最终兜底
 - **同会话有序**：Kafka Key = conversation_id；持久化事务 `SELECT last_seq FOR UPDATE` 串行分配 seq
 - **Outbox 有序并行**：conversation_id CRC32 映射到固定分片，每个全局 worker slot 由 MySQL `GET_LOCK` 唯一占用；同会话只发布最早未完成 seq，不同会话有界并行。Outbox 重试耗尽后必须先写 DLQ，成功后该 seq 才算终态并放行后续消息。
-- **在线推送失败**：Deliver 将连接级推送失败写入 DLQ，DLQ 确认成功后提交原 persisted offset；DLQ 发布失败时原 offset 保持未提交。
+- **在线推送失败**：Gateway 将连接级推送失败写入 DLQ，DLQ 确认成功后提交原 push offset；DLQ 发布失败时原 offset 保持未提交。本机没有连接时直接丢弃，客户端通过 `after_seq` 补偿。
 - **可靠事件**：messages 与 message_outbox 同事务提交；Outbox Publisher 按会话队头领取，失败退避重试，超限写入 DLQ
 - **ID 生成**：MySQL 号段 + version CAS + 双 Buffer 预加载；message_id 在持久化消费者内分配
-- **降级矩阵**：Redis 缓存失败回源 MySQL；Kafka ingress 不可用快速失败（不假成功）；在线投递失败由 after_seq 补偿
+- **降级矩阵**：Redis 缓存失败回源 MySQL；Kafka inbox 不可用快速失败（不假成功）；在线投递失败由 after_seq 补偿
 
 ## 运维
 
 - 指标：`rate_limit_rejected_total`、`breaker_state`、`outbox_pending_count`、`id_segment_remaining`、`kafka_consumer_lag` 等见各设计文档 §监控
 - 日志：请求链路记录 `request_id / user_id / conversation_id / client_msg_id / message_id`，不记录密码、Token、完整消息内容
-- 多节点：`server.node_id` 区分网关；Presence 存 Redis，投递按 node_id Pub/Sub；Kafka Consumer Group 每节点各一份
+- 多节点：`server.node_id` 区分网关；每个实例固定绑定一个 `im.message.push` partition，Outbox 根据 Redis Presence 中的 `partition_id` 定向投递；实例故障时不自动接管该 partition，在线用户通过重连和 `after_seq` 补偿
 
 ## License
 

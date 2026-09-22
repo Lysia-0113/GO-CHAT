@@ -1,5 +1,6 @@
-// Package outbox 是 Outbox Publisher：把 message_outbox 待投递记录发布到
-// im.message.persisted。MySQL 命名锁负责跨实例唯一分配全局 worker slot。
+// Package outbox 是 Outbox Publisher：把 message_outbox 待投递记录查询 Presence
+// 后直接发布到 im.message.push 的目标 Gateway partition。MySQL 命名锁负责
+// 跨实例唯一分配全局 worker slot。
 package outbox
 
 import (
@@ -10,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -88,7 +90,7 @@ func New(svcCtx *svc.ServiceContext, cfg Config) *Publisher {
 	}
 }
 
-// Run 周期领取并发布 persisted 事件，直至 ctx 取消。MySQL 命名锁保证同一
+// Run 周期领取并发布 push 事件，直至 ctx 取消。MySQL 命名锁保证同一
 // worker slot 在所有进程中最多只有一个活跃持有者；进程退出后其他实例可接管。
 func (p *Publisher) Run(appCtx context.Context) error {
 	for appCtx.Err() == nil {
@@ -247,10 +249,10 @@ func (p *Publisher) dispatch(ctx context.Context, ownerID string, shardIDs []int
 	wg.Wait()
 
 	if n, err := p.svcCtx.OutboxRepo.PendingCount(ctx); err == nil {
-		metrics.OutboxPending.WithLabelValues("message_persisted").Set(float64(n))
+		metrics.OutboxPending.WithLabelValues("message_push").Set(float64(n))
 	}
 	if age, err := p.svcCtx.OutboxRepo.OldestPendingAge(ctx); err == nil {
-		metrics.OutboxOldestAge.WithLabelValues("message_persisted").Set(float64(age))
+		metrics.OutboxOldestAge.WithLabelValues("message_push").Set(float64(age))
 	}
 }
 
@@ -261,22 +263,109 @@ func (p *Publisher) publishOne(ctx context.Context, rec repository.OutboxRecord,
 	}
 
 	event := rec.Payload
-	env, err := kafka.NewEnvelope(kafka.EventPersisted, "outbox-publisher", event.ConversationID, event)
+	targets, err := p.routeTargets(ctx, event)
 	if err != nil {
-		p.markFailed(ctx, rec, ownerID, "persisted envelope 构造失败: "+err.Error(), err, rec.RawPayload)
+		p.svcCtx.Log.Warn("outbox route lookup failed", "message_id", rec.MessageID, "error", err.Error())
+		metrics.OutboxPublishError.Inc()
+		p.markFailed(ctx, rec, ownerID, err.Error(), err, pushEnvelopeFallback(event, rec.RawPayload))
 		return
 	}
-	original, _ := env.Marshal()
-	if pubErr := p.svcCtx.Kafka.PublishPersisted(ctx, env); pubErr != nil {
-		p.svcCtx.Log.Warn("outbox publish failed", "message_id", rec.MessageID, "error", pubErr.Error())
-		metrics.OutboxPublishError.Inc()
-		p.markFailed(ctx, rec, ownerID, pubErr.Error(), pubErr, original)
-		return
+
+	// 没有在线用户时无需向 Kafka 写空事件；消息已持久化，客户端重连后
+	// 通过 Pull 补齐。存在多个 Gateway 时，逐 partition 发布同一条消息的
+	// 用户子集；任一 partition 发布失败都会重试整条 Outbox，Gateway 以
+	// message_id 做短期幂等。
+	var original []byte
+	for partition, userIDs := range targets {
+		pushEvent := toPushEvent(event, userIDs)
+		env, envelopeErr := kafka.NewEnvelope(kafka.EventPush, "outbox-publisher", event.ConversationID, pushEvent)
+		if envelopeErr != nil {
+			p.markFailed(ctx, rec, ownerID, "push envelope 构造失败: "+envelopeErr.Error(), envelopeErr, original)
+			return
+		}
+		// 记录当前 partition 的完整 Envelope，部分 partition 成功而后续
+		// 失败时，DLQ 至少保留最后一次实际尝试的目标用户集合。
+		original, _ = env.Marshal()
+		if pubErr := p.svcCtx.Kafka.PublishPush(ctx, partition, env); pubErr != nil {
+			p.svcCtx.Log.Warn("outbox push publish failed", "message_id", rec.MessageID, "partition", partition, "error", pubErr.Error())
+			metrics.OutboxPublishError.Inc()
+			p.markFailed(ctx, rec, ownerID, pubErr.Error(), pubErr, original)
+			return
+		}
 	}
 	if applied, mErr := p.svcCtx.OutboxRepo.MarkPublished(ctx, rec.MessageID, rec.EventType, ownerID); mErr != nil {
 		p.svcCtx.Log.Warn("outbox mark published failed", "message_id", rec.MessageID, "error", mErr.Error())
 	} else if !applied {
 		p.svcCtx.Log.Debug("outbox ownership lost after publish", "message_id", rec.MessageID)
+	}
+}
+
+// routeTargets 查询当前 Presence，把成员用户按固定 Gateway partition 聚合。
+// Presence 不一致时允许产生空投递或过期路由，Gateway 侧没有本地连接即丢弃。
+func (p *Publisher) routeTargets(ctx context.Context, event message.MessagePersistedEvent) (map[int][]int64, error) {
+	if p.svcCtx.Presence == nil {
+		return nil, errors.New("presence registry is not configured")
+	}
+	memberIDs := event.MemberIDs
+	if len(memberIDs) == 0 {
+		if p.svcCtx.ConvRepo == nil {
+			return nil, errors.New("outbox event has no member snapshot")
+		}
+		var err error
+		memberIDs, err = p.svcCtx.ConvRepo.ListMemberIDs(ctx, event.ConversationID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	partitionCount := p.svcCtx.Config.Kafka.PushPartitions
+	if partitionCount <= 0 {
+		partitionCount = 1
+	}
+	routesByUser, err := p.svcCtx.Presence.OnlineConnectionsBatch(ctx, memberIDs)
+	if err != nil {
+		return nil, err
+	}
+	grouped := make(map[int]map[int64]struct{})
+	for userID, routes := range routesByUser {
+		for _, route := range routes {
+			if route.PartitionID < 0 || route.PartitionID >= partitionCount {
+				// Presence 可能保留旧连接的短暂快照。无效 partition 没有
+				// 可投递目标，按离线处理并依赖 after_seq 补偿；不要因为一条
+				// 脏路由阻塞整个会话的 Outbox 队头。
+				p.svcCtx.Log.Warn("ignore invalid presence partition",
+					"user_id", userID, "partition", route.PartitionID, "partition_count", partitionCount)
+				continue
+			}
+			if grouped[route.PartitionID] == nil {
+				grouped[route.PartitionID] = make(map[int64]struct{})
+			}
+			grouped[route.PartitionID][userID] = struct{}{}
+		}
+	}
+	result := make(map[int][]int64, len(grouped))
+	for partition, users := range grouped {
+		ids := make([]int64, 0, len(users))
+		for userID := range users {
+			ids = append(ids, userID)
+		}
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		result[partition] = ids
+	}
+	return result, nil
+}
+
+func toPushEvent(event message.MessagePersistedEvent, userIDs []int64) message.MessagePushEvent {
+	return message.MessagePushEvent{
+		MessageID:       event.MessageID,
+		Seq:             event.Seq,
+		SenderID:        event.SenderID,
+		ClientMessageID: event.ClientMessageID,
+		ConversationID:  event.ConversationID,
+		MessageType:     event.MessageType,
+		Content:         event.Content,
+		ContentPreview:  event.ContentPreview,
+		CreatedAt:       event.CreatedAt,
+		TargetUserIDs:   userIDs,
 	}
 }
 
@@ -302,7 +391,8 @@ func (p *Publisher) markFailed(ctx context.Context, rec repository.OutboxRecord,
 func (p *Publisher) publishDLQ(ctx context.Context, rec repository.OutboxRecord, ownerID string, original []byte) {
 	if len(original) == 0 {
 		if rec.Payload.ConversationID != 0 {
-			if env, err := kafka.NewEnvelope(kafka.EventPersisted, "outbox-publisher", rec.ConversationID, rec.Payload); err == nil {
+			pushEvent := toPushEvent(rec.Payload, nil)
+			if env, err := kafka.NewEnvelope(kafka.EventPush, "outbox-publisher", rec.ConversationID, pushEvent); err == nil {
 				original, _ = env.Marshal()
 			}
 		}
@@ -315,7 +405,7 @@ func (p *Publisher) publishDLQ(ctx context.Context, rec repository.OutboxRecord,
 		conversationID = rec.Payload.ConversationID
 	}
 	payload := kafka.DLQPayload{
-		FailedTopic:     p.svcCtx.Topics.Persisted(),
+		FailedTopic:     p.svcCtx.Topics.Push(),
 		FailedPartition: -1,
 		FailedOffset:    -1,
 		RetryCount:      rec.RetryCount,
@@ -341,6 +431,16 @@ func (p *Publisher) publishDLQ(ctx context.Context, rec repository.OutboxRecord,
 	} else if !applied {
 		p.svcCtx.Log.Debug("outbox ownership lost after dlq publish", "message_id", rec.MessageID)
 	}
+}
+
+func pushEnvelopeFallback(event message.MessagePersistedEvent, fallback []byte) []byte {
+	pushEvent := toPushEvent(event, nil)
+	if env, err := kafka.NewEnvelope(kafka.EventPush, "outbox-publisher", event.ConversationID, pushEvent); err == nil {
+		if raw, marshalErr := env.Marshal(); marshalErr == nil {
+			return raw
+		}
+	}
+	return append([]byte(nil), fallback...)
 }
 
 func waitContext(ctx context.Context, duration time.Duration) bool {

@@ -17,6 +17,21 @@ type fakeConn struct {
 	err    error
 }
 
+type capturePresence struct {
+	route ConnectionRoute
+}
+
+func (p *capturePresence) Register(_ context.Context, route ConnectionRoute) error {
+	p.route = route
+	return nil
+}
+
+func (*capturePresence) Heartbeat(context.Context, ConnectionRoute) error { return nil }
+func (*capturePresence) Remove(context.Context, string, int64) error      { return nil }
+func (*capturePresence) OnlineConnections(context.Context, int64) ([]ConnectionRoute, error) {
+	return nil, nil
+}
+
 func (f *fakeConn) ID() string       { return f.id }
 func (f *fakeConn) UserID() int64    { return f.userID }
 func (f *fakeConn) DeviceID() string { return f.device }
@@ -69,6 +84,18 @@ func TestManagerRegisterUnregister(t *testing.T) {
 	}
 	if err := m.PushToConnection(context.Background(), "conn-1", Event{}); err != ErrConnectionNotFound {
 		t.Fatalf("expected ErrConnectionNotFound, got %v", err)
+	}
+}
+
+func TestManagerRegisterIncludesGatewayPartition(t *testing.T) {
+	presence := &capturePresence{}
+	m := NewManagerWithPartition("node-2", 3, presence)
+	conn := &fakeConn{id: "conn-partition", userID: 10, device: "web"}
+	if err := m.Register(context.Background(), conn); err != nil {
+		t.Fatal(err)
+	}
+	if presence.route.NodeID != "node-2" || presence.route.PartitionID != 3 {
+		t.Fatalf("unexpected presence route: %+v", presence.route)
 	}
 }
 

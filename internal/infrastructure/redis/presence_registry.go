@@ -3,6 +3,7 @@ package redis
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	goredis "github.com/redis/go-redis/v9"
@@ -94,52 +95,130 @@ func (p *PresenceRegistry) Remove(ctx context.Context, connectionID string, user
 // OnlineConnections 返回用户当前仍可能存活的连接路由
 // （GOCHAT_REDIS.md §5.3 查询：先清理过期成员再读取）。
 func (p *PresenceRegistry) OnlineConnections(ctx context.Context, userID int64) ([]connection.ConnectionRoute, error) {
+	all, err := p.OnlineConnectionsBatch(ctx, []int64{userID})
+	if err != nil {
+		return nil, err
+	}
+	return all[userID], nil
+}
+
+// OnlineConnectionsBatch 批量返回多个用户当前仍可能存活的连接路由。
+//
+// Outbox Publisher 每次处理的是一条会话消息，成员数可能达到上千；如果
+// 对每个成员单独执行 ZRANGE/GET，会把 Redis RTT 放大到成员数级别。这里
+// 把过期清理、ZSET 读取和连接路由 GET 分成两个 pipeline，保持查询次数
+// 与批次数量相关，而不是与成员数相关。
+func (p *PresenceRegistry) OnlineConnectionsBatch(ctx context.Context, userIDs []int64) (map[int64][]connection.ConnectionRoute, error) {
 	ctx, cancel := withTimeout(ctx, p.opts.ReadTimeout)
 	defer cancel()
 
-	userKey := PresenceUserKey(userID)
+	uniqueUserIDs := make([]int64, 0, len(userIDs))
+	seenUsers := make(map[int64]struct{}, len(userIDs))
+	for _, userID := range userIDs {
+		if userID <= 0 {
+			continue
+		}
+		if _, ok := seenUsers[userID]; ok {
+			continue
+		}
+		seenUsers[userID] = struct{}{}
+		uniqueUserIDs = append(uniqueUserIDs, userID)
+	}
+	routesByUser := make(map[int64][]connection.ConnectionRoute, len(uniqueUserIDs))
+	if len(uniqueUserIDs) == 0 {
+		return routesByUser, nil
+	}
+
 	now := time.Now().UnixMilli()
 
-	// 1. 清理已过期 connection_id
-	removed, err := p.client.ZRemRangeByScore(ctx, userKey, "-inf", IDString(now)).Result()
-	if err != nil {
-		return nil, errs.Wrap(errs.RedisUnavailable, "在线状态查询失败", err)
-	}
-	if removed > 0 && p.OnStaleCleanup != nil {
-		p.OnStaleCleanup(int(removed))
-	}
-
-	// 2. 获取剩余连接
-	ids, err := p.client.ZRange(ctx, userKey, 0, -1).Result()
-	if err != nil {
-		return nil, errs.Wrap(errs.RedisUnavailable, "在线状态查询失败", err)
-	}
-	if len(ids) == 0 {
-		return nil, nil
-	}
-
-	// 3. Pipeline 读取每个连接路由
-	routes := make([]connection.ConnectionRoute, 0, len(ids))
+	// 1. 对所有用户清理并读取已过期 connection_id。
 	pipe := p.client.Pipeline()
-	cmds := make([]*goredis.StringCmd, 0, len(ids))
-	for _, id := range ids {
-		cmds = append(cmds, pipe.Get(ctx, PresenceConnKey(id)))
+	removeCmds := make([]*goredis.IntCmd, 0, len(uniqueUserIDs))
+	rangeCmds := make([]*goredis.StringSliceCmd, 0, len(uniqueUserIDs))
+	for _, userID := range uniqueUserIDs {
+		userKey := PresenceUserKey(userID)
+		removeCmds = append(removeCmds, pipe.ZRemRangeByScore(ctx, userKey, "-inf", IDString(now)))
+		rangeCmds = append(rangeCmds, pipe.ZRange(ctx, userKey, 0, -1))
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
-		return nil, errs.Wrap(errs.RedisUnavailable, "在线状态查询失败", err)
+		return nil, errs.Wrap(errs.RedisUnavailable, "在线状态批量查询失败", err)
 	}
-	for i, id := range ids {
-		raw, err := cmds[i].Result()
+
+	staleCount := int64(0)
+	connectionIDsByUser := make(map[int64][]string)
+	for i, userID := range uniqueUserIDs {
+		removed, err := removeCmds[i].Result()
 		if err != nil {
-			// 路由 HASH 缺失（TTL 已过期）：从 ZSET 清理
-			_ = p.client.ZRem(ctx, userKey, id).Err()
-			continue
+			return nil, errs.Wrap(errs.RedisUnavailable, "在线状态批量查询失败", err)
+		}
+		staleCount += removed
+		ids, err := rangeCmds[i].Result()
+		if err != nil {
+			return nil, errs.Wrap(errs.RedisUnavailable, "在线状态批量查询失败", err)
+		}
+		if len(ids) > 0 {
+			connectionIDsByUser[userID] = ids
+		}
+	}
+	if staleCount > 0 && p.OnStaleCleanup != nil {
+		p.OnStaleCleanup(int(staleCount))
+	}
+
+	// 2. 去重后一次性读取所有连接路由。
+	type routeLookup struct {
+		userID       int64
+		connectionID string
+		cmd          *goredis.StringCmd
+	}
+	lookups := make([]routeLookup, 0)
+	seenConnections := make(map[string]struct{})
+	pipe = p.client.Pipeline()
+	for userID, ids := range connectionIDsByUser {
+		for _, connectionID := range ids {
+			if _, ok := seenConnections[connectionID]; ok {
+				continue
+			}
+			seenConnections[connectionID] = struct{}{}
+			lookups = append(lookups, routeLookup{
+				userID:       userID,
+				connectionID: connectionID,
+				cmd:          pipe.Get(ctx, PresenceConnKey(connectionID)),
+			})
+		}
+	}
+	if len(lookups) == 0 {
+		return routesByUser, nil
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, goredis.Nil) {
+		return nil, errs.Wrap(errs.RedisUnavailable, "在线状态批量查询失败", err)
+	}
+
+	// 3. 路由 HASH 可能在 ZSET 之后过期；缺失或损坏的成员只清理并忽略，
+	// 不影响同一批次中其他用户的在线投递。
+	cleanup := p.client.Pipeline()
+	cleanupCount := 0
+	for _, lookup := range lookups {
+		raw, err := lookup.cmd.Result()
+		if err != nil {
+			if errors.Is(err, goredis.Nil) {
+				cleanup.ZRem(ctx, PresenceUserKey(lookup.userID), lookup.connectionID)
+				cleanupCount++
+				continue
+			}
+			return nil, errs.Wrap(errs.RedisUnavailable, "在线状态批量查询失败", err)
 		}
 		var route connection.ConnectionRoute
-		if err := json.Unmarshal([]byte(raw), &route); err != nil {
+		if err := json.Unmarshal([]byte(raw), &route); err != nil || route.UserID != lookup.userID || route.ConnectionID != lookup.connectionID {
+			cleanup.ZRem(ctx, PresenceUserKey(lookup.userID), lookup.connectionID)
+			cleanupCount++
 			continue
 		}
-		routes = append(routes, route)
+		routesByUser[lookup.userID] = append(routesByUser[lookup.userID], route)
 	}
-	return routes, nil
+	if cleanupCount > 0 {
+		if _, err := cleanup.Exec(ctx); err == nil && p.OnStaleCleanup != nil {
+			p.OnStaleCleanup(cleanupCount)
+		}
+	}
+	return routesByUser, nil
 }
