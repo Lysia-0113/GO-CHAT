@@ -25,7 +25,7 @@ COPY . .
 # CGO_ENABLED=0：纯静态编译，产物不依赖系统动态库，任何 Linux 都能跑
 # -trimpath：产物里不带本机绝对路径，避免泄漏目录结构
 # -ldflags="-s -w"：去掉调试符号，减小镜像体积
-# -p=1 / GOMAXPROCS=2 限制构建期并行度，避免 2C2G 服务器构建镜像时
+# -p=1 / GOMAXPROCS=2 限制构建期并行度，避免资源受限服务器构建镜像时
 # 被 Go 编译器短时间占满内存；只影响构建速度，不影响运行时并发。
 RUN GOMAXPROCS=2 CGO_ENABLED=0 GOOS=linux go build -p=1 -trimpath -ldflags="-s -w" -o /out/gochat ./cmd/server \
     && GOMAXPROCS=2 CGO_ENABLED=0 GOOS=linux go build -p=1 -trimpath -ldflags="-s -w" -o /out/gochat-migrate ./cmd/migrate
@@ -48,7 +48,7 @@ RUN mkdir -p /app/config
 COPY --from=builder /out/gochat /out/gochat-migrate ./
 # 运行镜像必须带有配置文件；该文件只含低配参数，密码和依赖地址仍由
 # docker-compose 的环境变量覆盖。
-COPY config/config.2c2g.yaml /app/config/config.yaml
+COPY config/config.yaml.example /app/config/config.yaml
 
 USER appuser
 
